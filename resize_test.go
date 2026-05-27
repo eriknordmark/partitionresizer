@@ -3,14 +3,17 @@ package partitionresizer
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/diskfs/go-diskfs"
 	"github.com/diskfs/go-diskfs/backend/file"
+	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/diskfs/go-diskfs/partition/gpt"
 )
 
@@ -373,5 +376,454 @@ func TestCopyFilesystems(t *testing.T) {
 		t.Fatalf("error walking original filesystem: %v", err)
 	}
 }
+
+// TestCopyFilesystemsRawCopy exercises copyFilesystems' raw-block-copy
+// branch — the same one that handles squashfs partitions in the EVE
+// IMG[AB] case. partitionresizer routes both Type() == TypeSquashfs
+// and "unrecognized filesystem" to CopyPartitionRaw (resize.go); this
+// test triggers the path via an unrecognized-filesystem source so it
+// doesn't have to work around go-diskfs's current squashfs writer
+// limitations (squashfs.Finalize ignores fs.start; squashfs.Read on
+// a non-zero start offset fails on fragment decompression).
+//
+// Source and target partitions are equal-sized here. The "target
+// larger than source" grow case — which is what EVE actually wants
+// for IMGA→IMGA2 — currently fails at go-diskfs's verifyBlockCopy
+// (sync/verify.go) because it asserts target.ReadContents size ==
+// source size, ignoring that the target may legitimately be larger
+// and only the leading source-sized prefix is the meaningful copy.
+// That's a go-diskfs bug to address separately.
+func TestCopyFilesystemsRawCopy(t *testing.T) {
+	workDir := t.TempDir()
+	diskPath := filepath.Join(workDir, "disk.img")
+
+	const (
+		diskSize    int64 = 64 * MB
+		sectorSize        = 4096
+		sourceStart       = 256 // sectors; 1 MiB into disk
+		sourceSize        = 8 * MB
+		// Equal-sized target — exercises the raw-copy mechanism
+		// without tripping go-diskfs's verifyBlockCopy size assertion.
+		targetStart = sourceStart + (16 * MB / sectorSize)
+		targetSize  = 8 * MB
+	)
+
+	// Pre-allocate the disk image.
+	if err := os.WriteFile(diskPath, make([]byte, 0), 0o644); err != nil {
+		t.Fatalf("create disk file: %v", err)
+	}
+	if err := os.Truncate(diskPath, diskSize); err != nil {
+		t.Fatalf("size disk file: %v", err)
+	}
+
+	// Set up GPT with source + target partitions.
+	backend, err := file.OpenFromPath(diskPath, false)
+	if err != nil {
+		t.Fatalf("open backend: %v", err)
+	}
+	d, err := diskfs.OpenBackend(backend, diskfs.WithOpenMode(diskfs.ReadWrite), diskfs.WithSectorSize(sectorSize))
+	if err != nil {
+		_ = backend.Close()
+		t.Fatalf("open disk: %v", err)
+	}
+	table := &gpt.Table{
+		LogicalSectorSize:  sectorSize,
+		PhysicalSectorSize: sectorSize,
+		Partitions: []*gpt.Partition{
+			{Index: 1, Start: sourceStart, Size: sourceSize, Type: gpt.LinuxFilesystem, Name: "source"},
+			{Index: 2, Start: targetStart, Size: targetSize, Type: gpt.LinuxFilesystem, Name: "target"},
+		},
+	}
+	if err := d.Partition(table); err != nil {
+		_ = backend.Close()
+		t.Fatalf("write partition table: %v", err)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("close backend after partition write: %v", err)
+	}
+
+	// Fill the source partition with a deterministic non-filesystem
+	// pattern that go-diskfs cannot identify as any known type.
+	srcPattern := make([]byte, sourceSize)
+	for i := range srcPattern {
+		// avoid magic bytes that any FS probe might match: rotating
+		// non-zero pattern.
+		srcPattern[i] = byte((i % 251) + 1)
+	}
+	rw, err := os.OpenFile(diskPath, os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open disk for embedding pattern: %v", err)
+	}
+	if _, err := rw.WriteAt(srcPattern, sourceStart*sectorSize); err != nil {
+		_ = rw.Close()
+		t.Fatalf("write pattern: %v", err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatalf("close disk after embedding: %v", err)
+	}
+
+	// Re-open and confirm go-diskfs reports the source partition as
+	// having an unknown filesystem (which is the trigger for the
+	// raw-copy branch we want to exercise).
+	backend, err = file.OpenFromPath(diskPath, false)
+	if err != nil {
+		t.Fatalf("re-open backend: %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+	d, err = diskfs.OpenBackend(backend, diskfs.WithOpenMode(diskfs.ReadWrite), diskfs.WithSectorSize(sectorSize))
+	if err != nil {
+		t.Fatalf("re-open disk: %v", err)
+	}
+	if _, getErr := d.GetFilesystem(1); getErr == nil {
+		t.Fatal("source partition should not have a recognizable filesystem; got nil error")
+	}
+
+	// Exercise the partitionresizer raw-copy path.
+	resizes := []partitionResizeTarget{
+		{
+			original: partitionData{
+				number: 1,
+				start:  sourceStart * sectorSize,
+				size:   sourceSize,
+				label:  "source",
+			},
+			target: partitionData{
+				number: 2,
+				start:  targetStart * sectorSize,
+				size:   targetSize,
+				label:  "target",
+			},
+		},
+	}
+	if err := copyFilesystems(d, resizes); err != nil {
+		t.Fatalf("copyFilesystems failed: %v", err)
+	}
+
+	// Verify the target's leading sourceSize bytes match the source —
+	// this is the CopyPartitionRaw contract.
+	osFile, err := os.Open(diskPath)
+	if err != nil {
+		t.Fatalf("open disk for verification: %v", err)
+	}
+	defer func() { _ = osFile.Close() }()
+	dstBytes := make([]byte, sourceSize)
+	if _, err := osFile.ReadAt(dstBytes, targetStart*sectorSize); err != nil {
+		t.Fatalf("read target bytes: %v", err)
+	}
+	if !bytes.Equal(srcPattern, dstBytes) {
+		// Pinpoint the first differing byte to aid debugging.
+		for i := range srcPattern {
+			if srcPattern[i] != dstBytes[i] {
+				t.Errorf("raw-copy mismatch at byte %d: expected %#02x, got %#02x", i, srcPattern[i], dstBytes[i])
+				break
+			}
+		}
+	}
+
+	// The bytes after the copied region (target offset sourceSize..targetSize)
+	// were not part of the source and are not required to be any
+	// particular value — CopyPartitionRaw only copies the source-sized
+	// region. Don't assert on them.
+}
+
+// TestSwapPartitions verifies that swapPartitions round-trips the
+// Name / Type / GUID / Attributes fields between the original slot
+// and the target slot — this is the metadata-only step that gives
+// the new (large) partition the original name and the old (small)
+// partition the alternate label that removePartitions will later
+// mark Unused.
+func TestSwapPartitions(t *testing.T) {
+	workDir := t.TempDir()
+	f, err := os.CreateTemp(workDir, "disk.img")
+	if err != nil {
+		t.Fatalf("failed to create temp disk image: %v", err)
+	}
+	if err := os.Truncate(f.Name(), 1*GB); err != nil {
+		t.Fatalf("failed to truncate disk image: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	backend := file.New(f, false)
+	d, err := diskfs.OpenBackend(backend, diskfs.WithOpenMode(diskfs.ReadWrite))
+	if err != nil {
+		t.Fatalf("failed to open disk: %v", err)
+	}
+
+	const (
+		origGUID = "11111111-2222-3333-4444-555555555555"
+		altGUID  = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+		origName = "part1"
+		altName  = "part1_resized2"
+	)
+	var offset uint64 = 2048
+	table := &gpt.Table{
+		Partitions: []*gpt.Partition{
+			{
+				Index:      1,
+				Start:      offset,
+				Size:       36 * MB,
+				Type:       gpt.LinuxFilesystem,
+				GUID:       origGUID,
+				Name:       origName,
+				Attributes: 0x1,
+			},
+			{
+				Index:      3,
+				Start:      offset + 256*MB,
+				Size:       128 * MB,
+				Type:       gpt.EFISystemPartition,
+				GUID:       altGUID,
+				Name:       altName,
+				Attributes: 0x4,
+			},
+		},
+	}
+	if err := d.Partition(table); err != nil {
+		t.Fatalf("failed to write partition table: %v", err)
+	}
+
+	resizes := []partitionResizeTarget{
+		{
+			original: partitionData{number: 1},
+			target:   partitionData{number: 3},
+		},
+	}
+	if err := swapPartitions(d, resizes); err != nil {
+		t.Fatalf("swapPartitions failed: %v", err)
+	}
+
+	tableRaw, err := d.GetPartitionTable()
+	if err != nil {
+		t.Fatalf("failed to re-read partition table: %v", err)
+	}
+	newTable, ok := tableRaw.(*gpt.Table)
+	if !ok {
+		t.Fatalf("unsupported partition table type, only GPT is supported")
+	}
+
+	var slot1, slot3 *gpt.Partition
+	for _, p := range newTable.Partitions {
+		switch p.Index {
+		case 1:
+			slot1 = p
+		case 3:
+			slot3 = p
+		}
+	}
+	if slot1 == nil {
+		t.Fatal("partition slot 1 missing after swap")
+	}
+	if slot3 == nil {
+		t.Fatal("partition slot 3 missing after swap")
+	}
+
+	// Slot 1 (the old small one) should now carry the alt-labeled
+	// partition's metadata.
+	if slot1.Name != altName {
+		t.Errorf("slot 1 Name after swap: expected %q, got %q", altName, slot1.Name)
+	}
+	if slot1.Type != gpt.EFISystemPartition {
+		t.Errorf("slot 1 Type after swap: expected %v, got %v", gpt.EFISystemPartition, slot1.Type)
+	}
+	if !strings.EqualFold(slot1.GUID, altGUID) {
+		t.Errorf("slot 1 GUID after swap: expected %q, got %q", altGUID, slot1.GUID)
+	}
+	if slot1.Attributes != 0x4 {
+		t.Errorf("slot 1 Attributes after swap: expected 0x4, got 0x%x", slot1.Attributes)
+	}
+
+	// Slot 3 (the new large one) should now carry the original's
+	// metadata — this is what makes the new partition usable under
+	// the original name without bootloader / UUID-referring callers
+	// having to learn the new identity.
+	if slot3.Name != origName {
+		t.Errorf("slot 3 Name after swap: expected %q, got %q", origName, slot3.Name)
+	}
+	if slot3.Type != gpt.LinuxFilesystem {
+		t.Errorf("slot 3 Type after swap: expected %v, got %v", gpt.LinuxFilesystem, slot3.Type)
+	}
+	if !strings.EqualFold(slot3.GUID, origGUID) {
+		t.Errorf("slot 3 GUID after swap: expected %q, got %q", origGUID, slot3.GUID)
+	}
+	if slot3.Attributes != 0x1 {
+		t.Errorf("slot 3 Attributes after swap: expected 0x1, got 0x%x", slot3.Attributes)
+	}
+
+	// Geometry is untouched by swapPartitions — only metadata moves.
+	if slot1.Start != offset || slot1.Size != 36*MB {
+		t.Errorf("slot 1 geometry changed unexpectedly: start=%d size=%d", slot1.Start, slot1.Size)
+	}
+	if slot3.Start != offset+256*MB || slot3.Size != 128*MB {
+		t.Errorf("slot 3 geometry changed unexpectedly: start=%d size=%d", slot3.Start, slot3.Size)
+	}
+}
+
+// TestShrinkFilesystems verifies that shrinkFilesystems skips
+// partitions already at or below target size, invokes resize2fs only
+// when a shrink is needed, and propagates resize errors.
 func TestShrinkFilesystems(t *testing.T) {
+	// Use the existing small fixture (testdata/dist/disk.img), which
+	// has an ext4 partition at slot 2. Open via OpenFromPath so the
+	// backend has a non-empty Path() — shrinkFilesystems needs it to
+	// hand resize2fs a device path.
+	workDir := t.TempDir()
+	tmpFile := filepath.Join(workDir, "disk.img")
+	if err := testCopyFile(imgFile, tmpFile); err != nil {
+		t.Fatalf("failed to copy fixture: %v", err)
+	}
+	backend, err := file.OpenFromPath(tmpFile, false)
+	if err != nil {
+		t.Fatalf("failed to open disk image: %v", err)
+	}
+	defer func() { _ = backend.Close() }()
+
+	d, err := diskfs.OpenBackend(backend, diskfs.WithOpenMode(diskfs.ReadWrite))
+	if err != nil {
+		t.Fatalf("failed to open disk: %v", err)
+	}
+	tableRaw, err := d.GetPartitionTable()
+	if err != nil {
+		t.Fatalf("failed to get partition table: %v", err)
+	}
+	table, ok := tableRaw.(*gpt.Table)
+	if !ok {
+		t.Fatalf("unsupported partition table type, only GPT is supported")
+	}
+
+	// Find the ext4 partition in the fixture.
+	var ext4Part *gpt.Partition
+	for _, p := range table.Partitions {
+		fs, fsErr := d.GetFilesystem(p.Index)
+		if fsErr == nil && fs.Type() == filesystem.TypeExt4 {
+			ext4Part = p
+			break
+		}
+	}
+	if ext4Part == nil {
+		t.Fatal("fixture has no ext4 partition; check buildimg.sh")
+	}
+	ext4Size := int64(ext4Part.Size)
+	ext4Number := ext4Part.Index
+
+	t.Run("skip when current size already at target", func(t *testing.T) {
+		orig := execResize2fs
+		defer func() { execResize2fs = orig }()
+		called := false
+		execResize2fs = func(_ string, _ int64, _ bool) error {
+			called = true
+			return nil
+		}
+		resizes := []partitionResizeTarget{
+			{
+				original: partitionData{number: ext4Number, size: ext4Size},
+				target:   partitionData{size: ext4Size},
+			},
+		}
+		if err := shrinkFilesystems(d, resizes, false); err != nil {
+			t.Fatalf("shrinkFilesystems failed: %v", err)
+		}
+		if called {
+			t.Error("execResize2fs should not be invoked when original.size == target.size")
+		}
+	})
+
+	t.Run("skip when current size below target", func(t *testing.T) {
+		orig := execResize2fs
+		defer func() { execResize2fs = orig }()
+		called := false
+		execResize2fs = func(_ string, _ int64, _ bool) error {
+			called = true
+			return nil
+		}
+		resizes := []partitionResizeTarget{
+			{
+				original: partitionData{number: ext4Number, size: ext4Size},
+				target:   partitionData{size: ext4Size + 8*MB},
+			},
+		}
+		if err := shrinkFilesystems(d, resizes, false); err != nil {
+			t.Fatalf("shrinkFilesystems failed: %v", err)
+		}
+		if called {
+			t.Error("execResize2fs should not be invoked when original.size < target.size")
+		}
+	})
+
+	t.Run("invokes resize2fs when shrink needed", func(t *testing.T) {
+		orig := execResize2fs
+		defer func() { execResize2fs = orig }()
+		var gotPartDevice string
+		var gotMB int64
+		execResize2fs = func(partDevice string, newSizeMB int64, _ bool) error {
+			gotPartDevice = partDevice
+			gotMB = newSizeMB
+			return nil
+		}
+		targetSize := ext4Size - 8*MB
+		resizes := []partitionResizeTarget{
+			{
+				original: partitionData{number: ext4Number, size: ext4Size},
+				target:   partitionData{size: targetSize},
+			},
+		}
+		if err := shrinkFilesystems(d, resizes, false); err != nil {
+			t.Fatalf("shrinkFilesystems failed: %v", err)
+		}
+		if gotPartDevice == "" {
+			t.Error("execResize2fs was not called")
+		}
+		expectedMB := targetSize / (1024 * 1024)
+		if gotMB != expectedMB {
+			t.Errorf("execResize2fs newSizeMB: expected %d, got %d", expectedMB, gotMB)
+		}
+	})
+
+	t.Run("propagates resize2fs error", func(t *testing.T) {
+		orig := execResize2fs
+		defer func() { execResize2fs = orig }()
+		execResize2fs = func(_ string, _ int64, _ bool) error {
+			return fmt.Errorf("simulated resize failure")
+		}
+		resizes := []partitionResizeTarget{
+			{
+				original: partitionData{number: ext4Number, size: ext4Size},
+				target:   partitionData{size: ext4Size - 8*MB},
+			},
+		}
+		err := shrinkFilesystems(d, resizes, false)
+		if err == nil {
+			t.Fatal("expected error from shrinkFilesystems when resize2fs fails")
+		}
+		if !strings.Contains(err.Error(), "simulated resize failure") {
+			t.Errorf("error did not propagate: got %v", err)
+		}
+	})
+
+	t.Run("rejects non-ext4 source", func(t *testing.T) {
+		// FAT32 partition is slot 1 in the fixture.
+		var fat32Number int
+		for _, p := range table.Partitions {
+			fs, fsErr := d.GetFilesystem(p.Index)
+			if fsErr == nil && fs.Type() == filesystem.TypeFat32 {
+				fat32Number = p.Index
+				break
+			}
+		}
+		if fat32Number == 0 {
+			t.Skip("fixture has no FAT32 partition to test against")
+		}
+		resizes := []partitionResizeTarget{
+			{
+				original: partitionData{number: fat32Number, size: 30 * MB},
+				target:   partitionData{size: 20 * MB},
+			},
+		}
+		err := shrinkFilesystems(d, resizes, false)
+		if err == nil {
+			t.Fatal("expected error for non-ext4 source partition")
+		}
+		if !strings.Contains(err.Error(), "unsupported filesystem type") {
+			t.Errorf("expected 'unsupported filesystem type' error, got %v", err)
+		}
+	})
 }
