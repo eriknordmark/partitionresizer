@@ -133,10 +133,16 @@ func TestFindDisks(t *testing.T) {
 		if pd.label != "foo" {
 			t.Errorf("pd.label = %q, want foo", pd.label)
 		}
-		// start and size in bytes (blockSize=512)
+		// start, size, and end in bytes (blockSize=512). End is the
+		// inclusive last byte of the partition, i.e.
+		// (start_sector + size_sectors - 1) * blockSize.
 		if pd.start != 2*512 || pd.size != 4*512 {
 			t.Errorf("(start,size) = (%d,%d), want (%d,%d)",
 				pd.start, pd.size, 2*512, 4*512)
+		}
+		expectedEnd := int64((2+4-1) * 512)
+		if pd.end != expectedEnd {
+			t.Errorf("pd.end = %d, want %d", pd.end, expectedEnd)
 		}
 	})
 	t.Run("single", func(t *testing.T) {
