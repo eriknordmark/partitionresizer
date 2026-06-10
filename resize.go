@@ -298,17 +298,28 @@ func shrinkPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	if !ok {
 		return fmt.Errorf("unsupported partition table type, only GPT is supported")
 	}
+	// Look up partitions by their GPT Index, not by slice position.
+	// table.Partitions is compacted (only active entries), so the old
+	// table.Partitions[number-1] assumed a contiguous 1..N numbering and
+	// indexed the wrong entry -- or panicked -- on any non-contiguous layout
+	// (e.g. EVE's persist partition at index 9).
+	byIndex := make(map[int]*gpt.Partition)
+	for _, p := range table.Partitions {
+		byIndex[p.Index] = p
+	}
 	for _, r := range resizes {
 		if r.original.size <= r.target.size {
 			log.Printf("partition %d does not require shrinking, skipping", r.original.number)
 			continue
 		}
+		p, ok := byIndex[r.original.number]
+		if !ok {
+			return fmt.Errorf("partition %d not found in partition table", r.original.number)
+		}
 		log.Printf("Resizing partition %d to %d bytes", r.original.number, r.target.size)
-		// Update GPT entry for the shrink partition (indexed by number-1)
-		// set the new desired size
-		table.Partitions[r.original.number-1].Size = uint64(r.target.size)
-		// set the end to 0, so that it will be recalculated
-		table.Partitions[r.original.number-1].End = 0
+		// set the new desired size; set End to 0 so it is recalculated
+		p.Size = uint64(r.target.size)
+		p.End = 0
 		resizeCount++
 	}
 	if resizeCount == 0 {
