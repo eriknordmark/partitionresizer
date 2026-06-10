@@ -239,11 +239,11 @@ func TestRemovePartitions(t *testing.T) {
 	}
 }
 
-func TestRenumberPartitions(t *testing.T) {
+func TestRemoveAndRenumberPartitions(t *testing.T) {
 	// Model the state after createPartitions+copy+swap for two grown partitions:
 	// originals 2 and 3 (now carrying throwaway identities) plus their relocated
-	// copies in slots 5 and 6 (carrying the real labels). renumberPartitions must
-	// drop the originals and move the relocated copies back to numbers 2 and 3.
+	// copies in slots 5 and 6 (carrying the real labels). removeAndRenumberPartitions
+	// must drop the originals and move the relocated copies back to numbers 2 and 3.
 	workDir := t.TempDir()
 	f, err := os.CreateTemp(workDir, "disk.img")
 	if err != nil {
@@ -293,8 +293,8 @@ func TestRenumberPartitions(t *testing.T) {
 		},
 	}
 
-	if err := renumberPartitions(d, resizes); err != nil {
-		t.Fatalf("renumberPartitions failed: %v", err)
+	if err := removeAndRenumberPartitions(d, resizes); err != nil {
+		t.Fatalf("removeAndRenumberPartitions failed: %v", err)
 	}
 
 	tableRaw, err := d.GetPartitionTable()

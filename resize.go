@@ -63,7 +63,7 @@ func resize(d *disk.Disk, resizes []partitionResizeTarget, fixErrors, preserveNu
 	// remove the old partitions, optionally renumbering the relocated partitions
 	// back to their original partition numbers
 	if preserveNumbers {
-		if err := renumberPartitions(d, resizes); err != nil {
+		if err := removeAndRenumberPartitions(d, resizes); err != nil {
 			return err
 		}
 	} else {
@@ -232,17 +232,21 @@ func removePartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	return nil
 }
 
-// renumberPartitions removes the original partitions and reassigns each relocated
-// target partition's GPT slot index to the original partition's number, so the
-// resized partition keeps the same partition number it had before. This is the
+// removeAndRenumberPartitions removes the original partitions and reassigns each
+// relocated target partition's GPT slot index to the original partition's number, so
+// the resized partition keeps the same partition number it had before. This is the
 // preserve-numbers counterpart to removePartitions, and must run after the data
-// has been copied and the identities swapped onto the target partitions.
+// has been copied and the identities swapped onto the target partitions. Removal and
+// renumbering are done in a single GPT table write so the device never persists an
+// intermediate state where the original numbers are gone but the relocated slots have
+// not yet been renumbered.
 //
 // The renumbered entry stays at its new on-disk offset, so the resulting GPT entries
-// are no longer in disk-offset order. That is permitted by the GPT specification and
-// is invisible to consumers that locate a partition by its number (e.g. a boot loader
-// referencing (hd0,gptN)); only tools that expect entries sorted by offset will note it.
-func renumberPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
+// end up out of disk-offset order. That is permitted by the GPT specification and is
+// invisible to consumers that locate a partition by its number (e.g. a boot loader
+// referencing (hd0,gptN)); no common tool treats it as an error, though some offer an
+// optional manual sort to restore offset order.
+func removeAndRenumberPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	tableRaw, err := d.GetPartitionTable()
 	if err != nil {
 		return err
