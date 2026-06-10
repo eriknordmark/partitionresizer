@@ -139,6 +139,13 @@ func planResizes(
 	}
 	var done, pending []partitionResizeTarget
 	for _, pr := range prTargets {
+		// Already at the requested size: nothing to do. This is a grow that a
+		// prior, interrupted run already finished (the label now resolves to the
+		// finalized, grown partition), or simply a no-op request. A genuine
+		// shrink (original larger than target) is left to calculateResizes.
+		if pr.original.size == pr.target.size {
+			continue
+		}
 		alt, ok := existingByName[getAlternateLabel(pr.original.label)]
 		if !ok {
 			pending = append(pending, pr)

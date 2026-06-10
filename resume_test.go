@@ -20,8 +20,7 @@ const (
 	stepShrinkPartitions
 	stepCreatePartitions
 	stepCopyFilesystems
-	stepSwapPartitions
-	stepFinalize // renumber (preserveNumbers) or remove
+	stepUpdatePartitions // idempotent finalize: relabel/reindex + delete original
 )
 
 // runResizeStepsUpTo replays resize()'s pipeline against a freshly planned
@@ -70,13 +69,7 @@ func runResizeStepsUpTo(t *testing.T, path string, shrink PartitionIdentifier, g
 		{"shrinkPartitions", func() error { return shrinkPartitions(d, resizes) }},
 		{"createPartitions", func() error { return createPartitions(d, resizes) }},
 		{"copyFilesystems", func() error { return copyFilesystems(d, resizes) }},
-		{"swapPartitions", func() error { return swapPartitions(d, resizes) }},
-		{"finalize", func() error {
-			if preserveNumbers {
-				return removeAndRenumberPartitions(d, resizes)
-			}
-			return removePartitions(d, resizes)
-		}},
+		{"updatePartitions", func() error { return updatePartitions(d, resizes, preserveNumbers) }},
 	}
 	for i := 0; i < stopAfter && i < len(steps); i++ {
 		if err := steps[i].fn(); err != nil {
@@ -156,11 +149,6 @@ func TestRunResumeAfterInterruption(t *testing.T) {
 		// writeExtraFile additionally leaves a stale file in the created target
 		// fs, so it is non-empty and does not match the source.
 		writeExtraFile bool
-		// knownBroken, when non-empty, marks an interruption point whose resume
-		// behavior is currently incorrect (or undecided); the case is skipped
-		// with this reason. Empty means resume is expected to work and is
-		// asserted.
-		knownBroken string
 	}{
 		{name: "afterShrinkFilesystems", stopAfter: stepShrinkFilesystems},
 		{name: "afterShrinkPartitions", stopAfter: stepShrinkPartitions},
@@ -189,17 +177,12 @@ func TestRunResumeAfterInterruption(t *testing.T) {
 			name:      "afterCopyFilesystems",
 			stopAfter: stepCopyFilesystems,
 		},
-		// swapPartitions is intended to be a single, final relabel/reindex +
-		// delete-old operation; its resume semantics are a known design TBD.
 		{
-			name:        "afterSwapPartitions",
-			stopAfter:   stepSwapPartitions,
-			knownBroken: "design TBD: swap is meant to be a single final reindex/relabel+delete; swap is not idempotent and re-running resolves the label to the already-swapped partition",
-		},
-		{
-			name:        "afterFinalize",
-			stopAfter:   stepFinalize,
-			knownBroken: "depends on the post-swap resume design (TBD)",
+			// the whole resize completed, then the tool was re-run: the
+			// idempotent updatePartitions plus the "already at target size"
+			// short-circuit in planResizes must make this a no-op.
+			name:      "afterUpdatePartitions",
+			stopAfter: stepUpdatePartitions,
 		},
 	}
 
@@ -210,9 +193,6 @@ func TestRunResumeAfterInterruption(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
-				if tc.knownBroken != "" {
-					t.Skipf("resume not yet correct at this point: %s", tc.knownBroken)
-				}
 				tmpDir := t.TempDir()
 				tmpFile := filepath.Join(tmpDir, "diskfull.img")
 				if err := testCopyFile(diskfullImg, tmpFile); err != nil {

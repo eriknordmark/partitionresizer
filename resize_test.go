@@ -932,3 +932,131 @@ func TestShrinkFilesystems(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdatePartitions verifies the idempotent finalize step: relocated copies
+// take on their originals' identities (and, with preserveNumbers, their
+// numbers), the originals are removed, and re-running is a no-op. The input
+// models the state right after copyFilesystems: the originals (2, 3) still
+// carry the real identities at their old locations, and the relocated copies
+// (5, 6) carry the alternate "<label>_resized2" identities at new locations.
+func TestUpdatePartitions(t *testing.T) {
+	const sector = 512
+	// layout in sectors (Start is an LBA; Size is in bytes for gpt.Partition)
+	const (
+		part1Start = 2048
+		imgaOrig   = part1Start + 36*MB/sector // after part1 (36MB)
+		dataOrig   = imgaOrig + 100*MB/sector  // after IMGA original (100MB)
+		part4Start = dataOrig + 50*MB/sector   // after DATA original (50MB)
+		imgaCopy   = part4Start + 36*MB/sector // after part4 (36MB)
+		dataCopy   = imgaCopy + 300*MB/sector  // after IMGA copy (300MB)
+	)
+
+	for _, preserveNumbers := range []bool{false, true} {
+		name := "renumber"
+		if preserveNumbers {
+			name = "preserveNumbers"
+		}
+		t.Run(name, func(t *testing.T) {
+			workDir := t.TempDir()
+			f, err := os.CreateTemp(workDir, "disk.img")
+			if err != nil {
+				t.Fatalf("create temp disk: %v", err)
+			}
+			defer func() { _ = f.Close() }()
+			if err := os.Truncate(f.Name(), 1*GB); err != nil {
+				t.Fatalf("truncate disk: %v", err)
+			}
+			d, err := diskfs.OpenBackend(file.New(f, false), diskfs.WithOpenMode(diskfs.ReadWrite))
+			if err != nil {
+				t.Fatalf("open disk: %v", err)
+			}
+			table := &gpt.Table{
+				Partitions: []*gpt.Partition{
+					{Index: 1, Start: part1Start, Size: 36 * MB, Type: gpt.LinuxFilesystem, Name: "part1"},
+					{Index: 2, Start: imgaOrig, Size: 100 * MB, Type: gpt.LinuxFilesystem, Name: "IMGA"},
+					{Index: 3, Start: dataOrig, Size: 50 * MB, Type: gpt.LinuxFilesystem, Name: "DATA"},
+					{Index: 4, Start: part4Start, Size: 36 * MB, Type: gpt.LinuxFilesystem, Name: "part4"},
+					{Index: 5, Start: imgaCopy, Size: 300 * MB, Type: gpt.LinuxFilesystem, Name: getAlternateLabel("IMGA")},
+					{Index: 6, Start: dataCopy, Size: 200 * MB, Type: gpt.LinuxFilesystem, Name: getAlternateLabel("DATA")},
+				},
+			}
+			if err := d.Partition(table); err != nil {
+				t.Fatalf("write partition table: %v", err)
+			}
+
+			resizes := []partitionResizeTarget{
+				{
+					original: partitionData{number: 2, label: "IMGA", start: imgaOrig * sector},
+					target:   partitionData{number: 5, start: imgaCopy * sector},
+				},
+				{
+					original: partitionData{number: 3, label: "DATA", start: dataOrig * sector},
+					target:   partitionData{number: 6, start: dataCopy * sector},
+				},
+			}
+
+			// (idempotency across a re-run is covered end-to-end by
+			// TestRunResumeAfterInterruption/*/afterUpdatePartitions, which uses
+			// a fresh disk handle as a real resume does.)
+			if err := updatePartitions(d, resizes, preserveNumbers); err != nil {
+				t.Fatalf("updatePartitions failed: %v", err)
+			}
+
+			tableRaw, err := d.GetPartitionTable()
+			if err != nil {
+				t.Fatalf("get partition table: %v", err)
+			}
+			byIndex := make(map[int]*gpt.Partition)
+			for _, p := range tableRaw.(*gpt.Table).Partitions {
+				if p.Type == gpt.Unused {
+					continue
+				}
+				byIndex[p.Index] = p
+			}
+
+			// expected final number->(label, start-sector)
+			want := map[int]struct {
+				label string
+				start uint64
+			}{
+				1: {"part1", part1Start},
+				4: {"part4", part4Start},
+			}
+			if preserveNumbers {
+				want[2] = struct {
+					label string
+					start uint64
+				}{"IMGA", imgaCopy}
+				want[3] = struct {
+					label string
+					start uint64
+				}{"DATA", dataCopy}
+			} else {
+				want[5] = struct {
+					label string
+					start uint64
+				}{"IMGA", imgaCopy}
+				want[6] = struct {
+					label string
+					start uint64
+				}{"DATA", dataCopy}
+			}
+
+			if len(byIndex) != len(want) {
+				t.Fatalf("expected %d partitions, got %d", len(want), len(byIndex))
+			}
+			for number, w := range want {
+				p, ok := byIndex[number]
+				if !ok {
+					t.Fatalf("expected partition number %d (%s) to exist", number, w.label)
+				}
+				if p.Name != w.label {
+					t.Errorf("partition %d: label = %q, want %q", number, p.Name, w.label)
+				}
+				if p.Start != w.start {
+					t.Errorf("partition %d (%s): start = %d, want %d (data must not move)", number, w.label, p.Start, w.start)
+				}
+			}
+		})
+	}
+}

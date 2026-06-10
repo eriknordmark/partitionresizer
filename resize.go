@@ -55,23 +55,92 @@ func resize(d *disk.Disk, resizes []partitionResizeTarget, fixErrors, preserveNu
 		return err
 	}
 
-	// swap the partitions, specifically the labels, Type GUIDs, and UUIDs, as well as attributes flags
-	if err := swapPartitions(d, resizes); err != nil {
+	// finalize: in a single idempotent step, give each relocated target the
+	// original partition's identity (name, type GUID, partition GUID,
+	// attributes), set its partition number (the original number when
+	// preserveNumbers, otherwise the number it was created with), and remove the
+	// superseded original partition.
+	if err := updatePartitions(d, resizes, preserveNumbers); err != nil {
 		return err
 	}
 
-	// remove the old partitions, optionally renumbering the relocated partitions
-	// back to their original partition numbers
-	if preserveNumbers {
-		if err := removeAndRenumberPartitions(d, resizes); err != nil {
-			return err
+	return nil
+}
+
+// updatePartitions performs the final, idempotent phase of a resize. For each
+// relocated partition it gives the target the identity of its original (name,
+// type GUID, partition GUID, attributes), assigns the target's partition number
+// (the original number when preserveNumbers, otherwise the number it was created
+// with), and removes the now-superseded original -- all in a single partition
+// table write.
+//
+// It supersedes the swapPartitions + removePartitions/removeAndRenumberPartitions
+// sequence (still defined below but no longer called). Unlike the swap, it is idempotent:
+// it identifies partitions by their on-disk start offset -- the one identifier
+// that is stable across this phase, since names and numbers change -- sets the
+// desired final state directly rather than exchanging values, and treats an
+// already-removed original as a no-op. Re-running after an interruption
+// therefore converges instead of undoing a completed operation.
+func updatePartitions(d *disk.Disk, resizes []partitionResizeTarget, preserveNumbers bool) error {
+	tableRaw, err := d.GetPartitionTable()
+	if err != nil {
+		return err
+	}
+	table, ok := tableRaw.(*gpt.Table)
+	if !ok {
+		return fmt.Errorf("unsupported partition table type, only GPT is supported")
+	}
+	// Index active partitions by start sector. Start is the only identifier that
+	// does not change during this phase (names and numbers do), so it is the
+	// stable key for locating the target and the original on a re-run.
+	byStart := make(map[uint64]*gpt.Partition)
+	for _, p := range table.Partitions {
+		if p.Type == gpt.Unused {
+			continue
 		}
-	} else {
-		if err := removePartitions(d, resizes); err != nil {
-			return err
+		byStart[p.Start] = p
+	}
+	sectorSize := int64(table.LogicalSectorSize)
+	removeStart := make(map[uint64]bool)
+	for _, r := range resizes {
+		if r.original.start == r.target.start {
+			// shrunk in place: not relocated, so no identity move or removal
+			continue
+		}
+		targetStart := uint64(r.target.start / sectorSize)
+		originalStart := uint64(r.original.start / sectorSize)
+		target := byStart[targetStart]
+		if target == nil {
+			return fmt.Errorf("target partition for %s at start %d not found", r.original.label, r.target.start)
+		}
+		// Copy the original's identity onto the target, but only while the
+		// original is still present. Once a prior (interrupted) run has removed
+		// it, the target already carries the final identity and this is skipped.
+		if original := byStart[originalStart]; original != nil {
+			log.Printf("finalizing partition at start %d to identity of %s (partition %d); removing original", r.target.start, r.original.label, r.original.number)
+			target.Name = original.Name
+			target.Type = original.Type
+			target.GUID = original.GUID
+			target.Attributes = original.Attributes
+			removeStart[originalStart] = true
+		}
+		if preserveNumbers {
+			target.Index = r.original.number
 		}
 	}
-
+	if len(removeStart) > 0 {
+		kept := make([]*gpt.Partition, 0, len(table.Partitions))
+		for _, p := range table.Partitions {
+			if p.Type != gpt.Unused && removeStart[p.Start] {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		table.Partitions = kept
+	}
+	if err := d.Partition(table); err != nil {
+		return fmt.Errorf("failed to write updated partition table: %v", err)
+	}
 	return nil
 }
 
