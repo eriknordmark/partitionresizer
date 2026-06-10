@@ -56,6 +56,8 @@ const (
 // verify that a resize preserves data.
 type sampleLayout struct {
 	path        string
+	diskMB      int64
+	p9MB        int64
 	espStart    uint64 // sectors
 	imgaStart   uint64
 	imgbStart   uint64
@@ -71,6 +73,13 @@ type sampleLayout struct {
 // mksquashfs, as the real read-only image slots are), since go-diskfs cannot create squashfs and ext4 on
 // the same 512-byte-sector disk.
 func buildSampleLayout(t *testing.T) sampleLayout {
+	return buildSampleLayoutSized(t, defaultDiskMB, defaultP9MB)
+}
+
+// buildSampleLayoutSized is buildSampleLayout with an explicit disk size and P9
+// size, for tests that need a larger persist partition (e.g. a combined
+// shrink+grow in one Run, where go-diskfs rounds the shrink up to a whole GB).
+func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
 	t.Helper()
 	if _, err := exec.LookPath("mksquashfs"); err != nil {
 		t.Skip("mksquashfs not available")
@@ -89,7 +98,7 @@ func buildSampleLayout(t *testing.T) sampleLayout {
 	if err != nil {
 		t.Fatalf("create disk image: %v", err)
 	}
-	if err := f.Truncate(int64(defaultDiskMB) * MB); err != nil {
+	if err := f.Truncate(diskMB * MB); err != nil {
 		t.Fatalf("truncate disk image: %v", err)
 	}
 	_ = f.Close()
@@ -110,7 +119,7 @@ func buildSampleLayout(t *testing.T) sampleLayout {
 			{Index: imgaIndex, Start: imgaStart, Size: imgaMB * MB, Type: gpt.LinuxFilesystem, Name: "IMGA"},
 			{Index: imgbIndex, Start: imgbStart, Size: imgbMB * MB, Type: gpt.LinuxFilesystem, Name: "IMGB"},
 			{Index: configIndex, Start: configStart, Size: configMB * MB, Type: gpt.LinuxFilesystem, Name: "CONFIG"},
-			{Index: p9Index, Start: p9Start, Size: defaultP9MB * MB, Type: gpt.LinuxFilesystem, Name: "P9"},
+			{Index: p9Index, Start: p9Start, Size: uint64(p9MB) * MB, Type: gpt.LinuxFilesystem, Name: "P9"},
 		},
 	}
 	if err := d.Partition(table); err != nil {
@@ -140,6 +149,8 @@ func buildSampleLayout(t *testing.T) sampleLayout {
 
 	return sampleLayout{
 		path:        imgPath,
+		diskMB:      diskMB,
+		p9MB:        p9MB,
 		espStart:    espStart,
 		imgaStart:   imgaStart,
 		imgbStart:   imgbStart,
@@ -476,6 +487,11 @@ func gptDump(t *testing.T, path string) string {
 		t.Fatalf("open disk: %v", err)
 	}
 	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat disk: %v", err)
+	}
+	diskMB := fi.Size() / MB
 	d, err := diskfs.OpenBackend(file.New(f, true))
 	if err != nil {
 		t.Fatalf("open backend: %v", err)
@@ -511,7 +527,7 @@ func gptDump(t *testing.T, path string) string {
 		fmt.Fprintf(&b, "    %-3d %-10s %10d %10d %10d\n", r.idx, r.name, startMB, endMB, sizeMB)
 		prevEndMB = endMB
 	}
-	if tail := int64(defaultDiskMB) - prevEndMB; tail > 0 {
+	if tail := diskMB - prevEndMB; tail > 0 {
 		fmt.Fprintf(&b, "    %-3s %-10s %10s %10s %10d  <- free\n", "", "(free)", "", "", tail)
 	}
 	return b.String()
