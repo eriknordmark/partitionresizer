@@ -247,9 +247,19 @@ func TestChaosKill(t *testing.T) {
 	if _, err := exec.LookPath("mksquashfs"); err != nil {
 		t.Skip("mksquashfs not available")
 	}
-	// build the resizer binary
+	// build the resizer binary. If CHAOS_GPT_DELAY is set, build with -tags
+	// chaos and have the resizer delay around GPT-sector writes, so kills land
+	// between the backup/primary GPT writes (e.g. inside updatePartitions, a
+	// single fast table write that random-timed kills otherwise never catch).
 	bin := filepath.Join(t.TempDir(), "resizer")
-	if out, err := exec.Command("go", "build", "-o", bin, "./cmd/resizer").CombinedOutput(); err != nil {
+	buildArgs := []string{"build", "-o", bin}
+	gptDelay := os.Getenv("CHAOS_GPT_DELAY")
+	if gptDelay != "" {
+		buildArgs = append(buildArgs, "-tags", "chaos")
+		t.Setenv("RESIZER_GPT_WRITE_DELAY", gptDelay)
+	}
+	buildArgs = append(buildArgs, "./cmd/resizer")
+	if out, err := exec.Command("go", buildArgs...).CombinedOutput(); err != nil {
 		t.Fatalf("build resizer: %v\n%s", err, out)
 	}
 
@@ -277,7 +287,10 @@ func TestChaosKill(t *testing.T) {
 	}
 	t.Logf("CHAOS_SEED=%d", seed)
 	rng := rand.New(rand.NewSource(seed))
-	const trials = 5
+	trials := 5
+	if gptDelay != "" {
+		trials = 2 // GPT-write delays make each trial much slower
+	}
 	for trial := 0; trial < trials; trial++ {
 		dir := t.TempDir()
 		disk := filepath.Join(dir, "disk.img")
@@ -350,7 +363,15 @@ func runPhaseWithRandomKills(t *testing.T, bin, scratch string, args []string, r
 			}
 			return kills
 		}
-		delay := time.Duration(rng.Intn(2500)+50) * time.Millisecond
+		// Spread the kill across the operation. With GPT-write delays active the
+		// pipeline takes tens of seconds, so widen the range; otherwise early
+		// kills only ever land in the first (delayed) step and never reach
+		// updatePartitions.
+		maxKillMs := 2500
+		if os.Getenv("CHAOS_GPT_DELAY") != "" {
+			maxKillMs = 60000
+		}
+		delay := time.Duration(rng.Intn(maxKillMs)+50) * time.Millisecond
 		select {
 		case werr := <-done:
 			if werr == nil {
