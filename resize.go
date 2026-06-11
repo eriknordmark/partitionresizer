@@ -11,6 +11,14 @@ import (
 	"github.com/diskfs/go-diskfs/sync"
 )
 
+// isUnknownFilesystem reports whether err is a *disk.UnknownFilesystemError.
+// Use errors.As so the per-instance partition field doesn't matter
+// (which it would with errors.Is against a zero-valued instance).
+func isUnknownFilesystem(err error) bool {
+	var u *disk.UnknownFilesystemError
+	return errors.As(err, &u)
+}
+
 // resize performs the actual resize operations on the given disk
 func resize(d *disk.Disk, resizes []partitionResizeTarget, fixErrors bool) error {
 	// do any shrinks first
@@ -128,10 +136,10 @@ func copyFilesystems(d *disk.Disk, resizes []partitionResizeTarget) error {
 		log.Printf("copying data from original partition %d to new partition %d", r.original.number, r.target.number)
 		fs, err := d.GetFilesystem(r.original.number)
 		switch {
-		case err != nil && !errors.Is(err, &disk.UnknownFilesystemError{}):
+		case err != nil && !isUnknownFilesystem(err):
 			return fmt.Errorf("failed to get filesystem for partition %s: %v", r.original.label, err)
 		case err != nil || fs.Type() == filesystem.TypeSquashfs:
-			log.Printf("partition %d -> %d: performing raw data copy for filesystem type %v", r.original.number, r.target.number, fs.Type())
+			log.Printf("partition %d -> %d: performing raw data copy", r.original.number, r.target.number)
 			if err := sync.CopyPartitionRaw(d, r.original.number, r.target.number); err != nil {
 				return fmt.Errorf("failed to copy raw data for partition %s: %v", r.original.label, err)
 			}
