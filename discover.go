@@ -172,7 +172,11 @@ func findDisks(disk, syspath string) (map[string][]partitionData, error) {
 			if err != nil {
 				return nil, err
 			}
-			end := size - start + 1
+			// sysfs reports `size` as the partition's length in sectors
+			// (not its last LBA), so the inclusive last sector is
+			// start + size - 1. The disk-image branch above uses the
+			// same formula.
+			end := start + size - 1
 			// read from uevent to get name
 			ueventPath := filepath.Join(sysClassBlockPath, candidate.Name(), name, "uevent")
 			ueventData, err := os.ReadFile(ueventPath)
