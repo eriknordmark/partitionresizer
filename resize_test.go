@@ -122,8 +122,8 @@ func TestCreatePartitions(t *testing.T) {
 		if newPart.Size != uint64(r.target.size) {
 			t.Errorf("partition %d size mismatch: expected %d, got %d", r.target.number, r.target.size, newPart.Size)
 		}
-		if newPart.Name != r.original.label {
-			t.Errorf("partition %d label mismatch: expected %s, got %s", r.target.number, r.original.label, newPart.Name)
+		if newPart.Name != getAlternateLabel(r.original.label) {
+			t.Errorf("partition %d label mismatch: expected %s, got %s", r.target.number, getAlternateLabel(r.original.label), newPart.Name)
 		}
 	}
 }
