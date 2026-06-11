@@ -385,7 +385,14 @@ func runPhaseWithRandomKills(t *testing.T, bin, scratch string, args []string, r
 			kills++
 			// record how far the killed run got, so the long run can show
 			// whether kills land at every intermediate pipeline step
-			t.Logf("KILL_STEP=%s", chaosStepFromLog(stderr.String()))
+			step := chaosStepFromLog(stderr.String())
+			// Inspect the on-disk GPT immediately after the kill, before the next
+			// resume run heals it. A mid-updatePartitions kill can leave the
+			// primary and backup tables (each header + 32 entry sectors)
+			// disagreeing, or an entry array half-written so its CRC fails; this
+			// records exactly that. The disk image is the last positional arg.
+			diskPath := args[len(args)-1]
+			t.Logf("KILL_STEP=%s %s", step, gptIntegrity(diskPath))
 			// drop any partial resize2fs temp the killed run left behind
 			if matches, _ := filepath.Glob(filepath.Join(scratch, "partresizer-shrinkfs-*")); matches != nil {
 				for _, m := range matches {
