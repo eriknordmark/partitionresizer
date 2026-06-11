@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"strings"
 )
 
 // The helpers in this file parse GPT structures by reading raw disk sectors
@@ -56,6 +57,53 @@ func gptHeaderInfo(hdr []byte) (sigOK, crcOK bool, entriesCRC uint32, entriesLBA
 	num = binary.LittleEndian.Uint32(hdr[80:84])
 	esize = binary.LittleEndian.Uint32(hdr[84:88])
 	return
+}
+
+// gptEntryName decodes a GPT entry's 72-byte UTF-16LE name (ASCII labels only).
+func gptEntryName(b []byte) string {
+	var sb strings.Builder
+	for i := 0; i+1 < len(b); i += 2 {
+		c := uint16(b[i]) | uint16(b[i+1])<<8
+		if c == 0 {
+			break
+		}
+		sb.WriteRune(rune(c))
+	}
+	return sb.String()
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// gptPartitions parses the primary GPT entry array (LBA 1 header) and returns a
+// map of partition label -> [firstLBA, lastLBA]. Used to locate a grow target
+// and its source on disk without depending on the in-memory fixture layout.
+func gptPartitions(f *os.File) map[string][2]int64 {
+	sig, _, _, eLBA, num, esize := gptHeaderInfo(readAt(f, 512, 512))
+	if !sig || num == 0 || esize < 128 {
+		return nil
+	}
+	ent := readAt(f, eLBA*512, int64(num)*int64(esize))
+	if ent == nil {
+		return nil
+	}
+	out := map[string][2]int64{}
+	for i := 0; i < int(num); i++ {
+		e := ent[i*int(esize) : i*int(esize)+128]
+		if allZero(e[0:16]) { // empty type GUID => unused slot
+			continue
+		}
+		first := int64(binary.LittleEndian.Uint64(e[32:40]))
+		last := int64(binary.LittleEndian.Uint64(e[40:48]))
+		out[gptEntryName(e[56:128])] = [2]int64{first, last}
+	}
+	return out
 }
 
 // gptIntegrity inspects the on-disk GPT of a 512-byte-sector image and returns a

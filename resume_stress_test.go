@@ -393,6 +393,12 @@ func runPhaseWithRandomKills(t *testing.T, bin, scratch string, args []string, r
 			// records exactly that. The disk image is the last positional arg.
 			diskPath := args[len(args)-1]
 			t.Logf("KILL_STEP=%s %s", step, gptIntegrity(diskPath))
+			// Optional (CHAOS_COPY_STATE): also classify each grow target's data
+			// region so a copyFilesystems kill is shown as empty/partial/complete,
+			// not just inferred from the step marker. Off by default.
+			if os.Getenv("CHAOS_COPY_STATE") != "" {
+				t.Logf("KILL_STEP=%s %s", step, copyDestState(diskPath))
+			}
 			// drop any partial resize2fs temp the killed run left behind
 			if matches, _ := filepath.Glob(filepath.Join(scratch, "partresizer-shrinkfs-*")); matches != nil {
 				for _, m := range matches {
