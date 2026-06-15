@@ -39,33 +39,33 @@ func wholeDiskSum(t *testing.T, path string) [32]byte {
 // --- #3: untouched partitions stay byte-identical ----------------------------
 
 // TestUntouchedPartitionsByteIntegrity verifies that the partitions a grow
-// must not touch -- persist (P9, user data) and CONFIG -- are byte-for-byte
-// unchanged across Case 2, and that P9's filesystem data survives.
+// must not touch -- persist (P3, user data) and CONFIG -- are byte-for-byte
+// unchanged across Case 2, and that P3's filesystem data survives.
 func TestUntouchedPartitionsByteIntegrity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow end-to-end resize test")
 	}
 	fx := buildSampleLayout(t)
-	if err := Run(fx.path, nil, shrinkP9, false, false, false); err != nil {
-		t.Fatalf("Case 1 (shrink P9): %v", err)
+	if err := Run(fx.path, nil, shrinkP3, false, false, false); err != nil {
+		t.Fatalf("Case 1 (shrink P3): %v", err)
 	}
-	p9Len := int((defaultP9MB - 600) * MB)
+	p3Len := int((defaultP3MB - 600) * MB)
 	cfgLen := int(configMB * MB)
-	p9Before := partitionRegionSum(t, fx.path, fx.p9Start, p9Len)
+	p3Before := partitionRegionSum(t, fx.path, fx.p3Start, p3Len)
 	cfgBefore := partitionRegionSum(t, fx.path, fx.configStart, cfgLen)
 
 	if err := Run(fx.path, nil, growImages, false, false, true); err != nil {
 		t.Fatalf("Case 2 (grow): %v", err)
 	}
 
-	if partitionRegionSum(t, fx.path, fx.p9Start, p9Len) != p9Before {
-		t.Error("P9 (persist) region changed during the grow")
+	if partitionRegionSum(t, fx.path, fx.p3Start, p3Len) != p3Before {
+		t.Error("P3 (persist) region changed during the grow")
 	}
 	if partitionRegionSum(t, fx.path, fx.configStart, cfgLen) != cfgBefore {
 		t.Error("CONFIG region changed during the grow")
 	}
-	if got := readPartitionFile(t, fx.path, p9Index, "/p9-marker.txt"); got != "persist content" {
-		t.Errorf("P9 data lost: marker = %q", got)
+	if got := readPartitionFile(t, fx.path, p3Index, "/p3-marker.txt"); got != "persist content" {
+		t.Errorf("P3 data lost: marker = %q", got)
 	}
 }
 
@@ -94,7 +94,7 @@ func TestInsufficientSpaceIsAtomic(t *testing.T) {
 
 // --- #5: refuse to shrink below the filesystem's used size -------------------
 
-// TestShrinkBelowUsedAborts verifies that asking to shrink P9 below its ext4
+// TestShrinkBelowUsedAborts verifies that asking to shrink P3 below its ext4
 // used size makes e2fsck/resize2fs refuse, and the resize aborts with the
 // partition and its data untouched.
 func TestShrinkBelowUsedAborts(t *testing.T) {
@@ -102,22 +102,22 @@ func TestShrinkBelowUsedAborts(t *testing.T) {
 		t.Skip("slow end-to-end resize test")
 	}
 	fx := buildSampleLayout(t)
-	p9Before := partitionRegionSum(t, fx.path, fx.p9Start, int(defaultP9MB*MB))
+	p3Before := partitionRegionSum(t, fx.path, fx.p3Start, int(defaultP3MB*MB))
 
-	// 16 MB is well below P9's used size; resize2fs must refuse
-	err := Run(fx.path, nil, []PartitionChange{NewPartitionChange(IdentifierByLabel, "P9", 16*MB)}, false, false, false)
+	// 16 MB is well below P3's used size; resize2fs must refuse
+	err := Run(fx.path, nil, []PartitionChange{NewPartitionChange(IdentifierByLabel, "P3", 16*MB)}, false, false, false)
 	if err == nil {
 		t.Fatal("expected resize2fs to refuse shrinking below used size, got nil")
 	}
 	after := gptByName(t, fx.path)
-	if got := int64(after["P9"].GetSize()); got != defaultP9MB*MB {
-		t.Errorf("P9 size changed to %d despite the failed shrink (want %d)", got, defaultP9MB*MB)
+	if got := int64(after["P3"].GetSize()); got != defaultP3MB*MB {
+		t.Errorf("P3 size changed to %d despite the failed shrink (want %d)", got, defaultP3MB*MB)
 	}
-	if partitionRegionSum(t, fx.path, fx.p9Start, int(defaultP9MB*MB)) != p9Before {
-		t.Error("P9 region changed despite the failed shrink")
+	if partitionRegionSum(t, fx.path, fx.p3Start, int(defaultP3MB*MB)) != p3Before {
+		t.Error("P3 region changed despite the failed shrink")
 	}
-	if got := readPartitionFile(t, fx.path, p9Index, "/p9-marker.txt"); got != "persist content" {
-		t.Errorf("P9 data lost: marker = %q", got)
+	if got := readPartitionFile(t, fx.path, p3Index, "/p3-marker.txt"); got != "persist content" {
+		t.Errorf("P3 data lost: marker = %q", got)
 	}
 	t.Logf("aborted cleanly: %v", err)
 }
@@ -125,71 +125,71 @@ func TestShrinkBelowUsedAborts(t *testing.T) {
 // --- #6: combined shrink + grow in a single Run ------------------------------
 
 // TestCombinedShrinkGrow exercises the natural one-shot usage: a single
-// Run that shrinks P9 to make room and grows ESP/IMGA/IMGB. go-diskfs rounds
-// the shrink up to a whole GB, so this uses a larger P9 (1400 MB) than the
+// Run that shrinks P3 to make room and grows ESP/IMGA/IMGB. go-diskfs rounds
+// the shrink up to a whole GB, so this uses a larger P3 (1400 MB) than the
 // default fixture.
 func TestCombinedShrinkGrow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow end-to-end resize test")
 	}
-	const p9MB = 1400
-	const diskMB = p9MB + 252 // front partitions (~250 MB) + margin
-	fx := buildSampleLayoutSized(t, diskMB, p9MB)
+	const p3MB = 1400
+	const diskMB = p3MB + 252 // front partitions (~250 MB) + margin
+	fx := buildSampleLayoutSized(t, diskMB, p3MB)
 
-	shrink := NewPartitionIdentifier(IdentifierByLabel, "P9")
+	shrink := NewPartitionIdentifier(IdentifierByLabel, "P3")
 	if err := Run(fx.path, &shrink, growImages, false, false, true); err != nil {
 		t.Fatalf("combined shrink+grow Run: %v", err)
 	}
 
 	after := gptByName(t, fx.path)
-	// P9 shrunk by the GB-rounded total grow (496 MB -> 1 GB)
-	if got := int64(after["P9"].GetSize()); got != (p9MB-1024)*MB {
-		t.Errorf("P9 size = %d, want %d", got, (p9MB-1024)*MB)
+	// P3 shrunk by the GB-rounded total grow (496 MB -> 1 GB)
+	if got := int64(after["P3"].GetSize()); got != (p3MB-1024)*MB {
+		t.Errorf("P3 size = %d, want %d", got, (p3MB-1024)*MB)
 	}
-	if after["ESP"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
-		t.Errorf("indices not preserved: ESP=%d IMGA=%d IMGB=%d", after["ESP"].Index, after["IMGA"].Index, after["IMGB"].Index)
+	if after["EFI System"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
+		t.Errorf("indices not preserved: ESP=%d IMGA=%d IMGB=%d", after["EFI System"].Index, after["IMGA"].Index, after["IMGB"].Index)
 	}
-	if after["IMGA"].Start <= after["P9"].Start {
-		t.Errorf("IMGA (%d) not relocated past P9 (%d)", after["IMGA"].Start, after["P9"].Start)
+	if after["IMGA"].Start <= after["P3"].Start {
+		t.Errorf("IMGA (%d) not relocated past P3 (%d)", after["IMGA"].Start, after["P3"].Start)
 	}
-	if int64(after["ESP"].GetSize()) != 96*MB || int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB {
-		t.Errorf("grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after["ESP"].GetSize(), after["IMGA"].GetSize(), after["IMGB"].GetSize())
+	if int64(after["EFI System"].GetSize()) != 96*MB || int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB {
+		t.Errorf("grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after["EFI System"].GetSize(), after["IMGA"].GetSize(), after["IMGB"].GetSize())
 	}
 	if got := partitionRegionSum(t, fx.path, after["IMGA"].Start, 1*MB); got != fx.imgaSum {
 		t.Error("IMGA content not preserved")
 	}
 }
 
-// --- #7: realistic P9 content survives the shrink ----------------------------
+// --- #7: realistic P3 content survives the shrink ----------------------------
 
-// TestShrinkPreservesP9Content fills P9 with many files (so resize2fs has
+// TestShrinkPreservesP3Content fills P3 with many files (so resize2fs has
 // real data to relocate during the shrink), shrinks it, then verifies every
 // file is intact.
-func TestShrinkPreservesP9Content(t *testing.T) {
+func TestShrinkPreservesP3Content(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow end-to-end resize test")
 	}
 	fx := buildSampleLayout(t)
-	want := populateP9(t, fx.path, 30)
+	want := populateP3(t, fx.path, 30)
 
-	// shrink P9 from 900 MB to 200 MB (above used; forces block relocation)
-	if err := Run(fx.path, nil, []PartitionChange{NewPartitionChange(IdentifierByLabel, "P9", 200*MB)}, false, false, false); err != nil {
-		t.Fatalf("shrink P9: %v", err)
+	// shrink P3 from 900 MB to 200 MB (above used; forces block relocation)
+	if err := Run(fx.path, nil, []PartitionChange{NewPartitionChange(IdentifierByLabel, "P3", 200*MB)}, false, false, false); err != nil {
+		t.Fatalf("shrink P3: %v", err)
 	}
 	after := gptByName(t, fx.path)
-	if got := int64(after["P9"].GetSize()); got != 200*MB {
-		t.Errorf("P9 size = %d, want %d", got, 200*MB)
+	if got := int64(after["P3"].GetSize()); got != 200*MB {
+		t.Errorf("P3 size = %d, want %d", got, 200*MB)
 	}
 	for name, content := range want {
-		if got := readPartitionFile(t, fx.path, p9Index, name); got != content {
-			t.Errorf("P9 file %s content mismatch after shrink (len got=%d want=%d)", name, len(got), len(content))
+		if got := readPartitionFile(t, fx.path, p3Index, name); got != content {
+			t.Errorf("P3 file %s content mismatch after shrink (len got=%d want=%d)", name, len(got), len(content))
 		}
 	}
 }
 
-// populateP9 writes n distinct files into the P9 filesystem and returns their
+// populateP3 writes n distinct files into the P3 filesystem and returns their
 // expected contents.
-func populateP9(t *testing.T, path string, n int) map[string]string {
+func populateP3(t *testing.T, path string, n int) map[string]string {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -200,13 +200,13 @@ func populateP9(t *testing.T, path string, n int) map[string]string {
 	if err != nil {
 		t.Fatalf("open disk: %v", err)
 	}
-	fs, err := d.GetFilesystem(p9Index)
+	fs, err := d.GetFilesystem(p3Index)
 	if err != nil {
-		t.Fatalf("get P9 filesystem: %v", err)
+		t.Fatalf("get P3 filesystem: %v", err)
 	}
 	want := make(map[string]string, n)
 	for i := 0; i < n; i++ {
-		name := fmt.Sprintf("/p9file-%02d.dat", i)
+		name := fmt.Sprintf("/p3file-%02d.dat", i)
 		// a few KB of deterministic, per-file content
 		content := fmt.Sprintf("file %d:", i)
 		for len(content) < 4096 {
@@ -268,13 +268,13 @@ func TestChaosKill(t *testing.T) {
 	}
 
 	// fresh base (NOT pre-shrunk): the chaos performs the full two-step
-	// resize -- shrink P9, then grow ESP/IMGA/IMGB -- so kills can land in the
+	// resize -- shrink P3, then grow ESP/IMGA/IMGB -- so kills can land in the
 	// shrink steps (resize2fs) as well as create/copy/update.
 	base := buildSampleLayout(t)
 	cfgLen := int(configMB * MB)
 	cfgSum := partitionRegionSum(t, base.path, base.configStart, cfgLen)
 
-	shrinkArgs := []string{"--grow-partition", "label:P9:300M"} // Case 1: shrink P9 in place
+	shrinkArgs := []string{"--grow-partition", "label:P3:300M"} // Case 1: shrink P3 in place
 	growArgs := []string{                                       // Case 2: grow into the freed space
 		"--preserve-numbers",
 		"--grow-partition", "label:ESP:96M",
@@ -306,19 +306,19 @@ func TestChaosKill(t *testing.T) {
 			t.Fatalf("mkdir scratch: %v", err)
 		}
 
-		// Phase 1: shrink P9, then Phase 2: grow -- each driven through random
+		// Phase 1: shrink P3, then Phase 2: grow -- each driven through random
 		// SIGKILLs and re-run to completion.
 		ks := runPhaseWithRandomKills(t, bin, scratch, append(append([]string{}, shrinkArgs...), disk), rng)
 		kg := runPhaseWithRandomKills(t, bin, scratch, append(append([]string{}, growArgs...), disk), rng)
 
 		after := gptByName(t, disk)
-		if got := int64(after["P9"].GetSize()); got != (defaultP9MB-600)*MB {
-			t.Errorf("trial %d: P9 size = %d, want %d", trial, got, (defaultP9MB-600)*MB)
+		if got := int64(after["P3"].GetSize()); got != (defaultP3MB-600)*MB {
+			t.Errorf("trial %d: P3 size = %d, want %d", trial, got, (defaultP3MB-600)*MB)
 		}
-		if after["ESP"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
+		if after["EFI System"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
 			t.Errorf("trial %d: indices not preserved", trial)
 		}
-		if int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB || int64(after["ESP"].GetSize()) != 96*MB {
+		if int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB || int64(after["EFI System"].GetSize()) != 96*MB {
 			t.Errorf("trial %d: grown sizes wrong", trial)
 		}
 		if partitionRegionSum(t, disk, after["IMGA"].Start, 1*MB) != base.imgaSum ||
@@ -328,8 +328,8 @@ func TestChaosKill(t *testing.T) {
 		if partitionRegionSum(t, disk, base.configStart, cfgLen) != cfgSum {
 			t.Errorf("trial %d: CONFIG corrupted by interrupted resize", trial)
 		}
-		if got := readPartitionFile(t, disk, p9Index, "/p9-marker.txt"); got != "persist content" {
-			t.Errorf("trial %d: P9 data lost: marker = %q", trial, got)
+		if got := readPartitionFile(t, disk, p3Index, "/p3-marker.txt"); got != "persist content" {
+			t.Errorf("trial %d: P3 data lost: marker = %q", trial, got)
 		}
 		t.Logf("trial %d converged: %d shrink-kill(s), %d grow-kill(s)", trial, ks, kg)
 	}

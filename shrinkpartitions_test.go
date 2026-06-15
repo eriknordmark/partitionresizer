@@ -34,21 +34,21 @@ func TestShrinkPartitionsSparseIndex(t *testing.T) {
 	}
 
 	p1Start := uint64(2048)
-	p9Start := p1Start + 36*MB/sector
+	p3Start := p1Start + 36*MB/sector
 	table := &gpt.Table{
 		Partitions: []*gpt.Partition{
 			{Index: 1, Start: p1Start, Size: 36 * MB, Type: gpt.LinuxFilesystem, Name: "p1"},
 			// index 9, slice position 1: the case that broke table.Partitions[8]
-			{Index: 9, Start: p9Start, Size: 128 * MB, Type: gpt.LinuxFilesystem, Name: "P9"},
+			{Index: 9, Start: p3Start, Size: 128 * MB, Type: gpt.LinuxFilesystem, Name: "P3"},
 		},
 	}
 	if err := d.Partition(table); err != nil {
 		t.Fatalf("write partition table: %v", err)
 	}
 
-	// shrink P9 (index 9) from 128 MB to 64 MB
+	// shrink P3 (index 9) from 128 MB to 64 MB
 	resizes := []partitionResizeTarget{{
-		original: partitionData{number: 9, label: "P9", size: 128 * MB},
+		original: partitionData{number: 9, label: "P3", size: 128 * MB},
 		target:   partitionData{number: 9, size: 64 * MB},
 	}}
 	if err := shrinkPartitions(d, resizes); err != nil {
@@ -67,7 +67,7 @@ func TestShrinkPartitionsSparseIndex(t *testing.T) {
 		byIndex[p.Index] = p
 	}
 	if got := int64(byIndex[9].GetSize()); got != 64*MB {
-		t.Errorf("P9 (index 9) size = %d, want %d", got, 64*MB)
+		t.Errorf("P3 (index 9) size = %d, want %d", got, 64*MB)
 	}
 	// the partition at slice position 8 does not exist; the partition that the
 	// old code would have touched (index 1) must be left alone

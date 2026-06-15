@@ -22,15 +22,17 @@ import (
 // shape of an A/B-image appliance disk -- the layout EVE-OS uses, which
 // motivated this tool: a FAT32 ESP, two read-only squashfs image slots, a small
 // config partition, and an ext4 data partition that fills the rest at a
-// non-contiguous index. Every size is scaled down from the real ~64 GB device
-// so the tests run in seconds while exercising the same partition types and
-// code paths:
+// non-contiguous index. The GPT partition names below are the real EVE-OS
+// labels ("EFI System" for the ESP, "P3" for the persist partition at index 9),
+// so the fixture matches what production code identifies by label. Every size is
+// scaled down from the real ~64 GB device so the tests run in seconds while
+// exercising the same partition types and code paths:
 //
-//	ESP    FAT32, "tiny"            48 MB   index 1
-//	IMGA   squashfs image          100 MB  index 2
-//	IMGB   squashfs image          100 MB  index 3
-//	CONFIG placeholder ("1MB")       1 MB   index 4   (untouched by the resize)
-//	P9     ext4, fills the rest    900 MB  index 9
+//	"EFI System" FAT32, "tiny"          48 MB   index 1
+//	IMGA         squashfs image        100 MB  index 2
+//	IMGB         squashfs image        100 MB  index 3
+//	CONFIG       placeholder ("1MB")     1 MB   index 4   (untouched by the resize)
+//	P3           ext4, fills the rest  900 MB  index 9
 //
 // FAT32 cannot be represented at 1 MB (it needs tens of MB of clusters), and
 // partitionresizer never touches CONFIG, so CONFIG is left as a 1 MB
@@ -43,13 +45,13 @@ const (
 	imgaMB        = 100
 	imgbMB        = 100
 	configMB      = 1
-	defaultP9MB   = 900
+	defaultP3MB   = 900
 
 	espIndex    = 1
 	imgaIndex   = 2
 	imgbIndex   = 3
 	configIndex = 4
-	p9Index     = 9
+	p3Index     = 9
 )
 
 // sampleLayout records the built disk and the content fingerprints needed to
@@ -57,29 +59,29 @@ const (
 type sampleLayout struct {
 	path        string
 	diskMB      int64
-	p9MB        int64
+	p3MB        int64
 	espStart    uint64 // sectors
 	imgaStart   uint64
 	imgbStart   uint64
 	configStart uint64
-	p9Start     uint64
+	p3Start     uint64
 	imgaSum     [32]byte // sha256 of the IMGA partition image region
 	imgbSum     [32]byte
 }
 
 // buildSampleLayout writes the scaled sample disk image into a temp file and
-// returns its description. ESP and P9 get real FAT32/ext4 filesystems with
+// returns its description. ESP and P3 get real FAT32/ext4 filesystems with
 // marker files; IMGA/IMGB get real squashfs images written raw (built with
 // mksquashfs, as the real read-only image slots are), since go-diskfs cannot create squashfs and ext4 on
 // the same 512-byte-sector disk.
 func buildSampleLayout(t *testing.T) sampleLayout {
-	return buildSampleLayoutSized(t, defaultDiskMB, defaultP9MB)
+	return buildSampleLayoutSized(t, defaultDiskMB, defaultP3MB)
 }
 
-// buildSampleLayoutSized is buildSampleLayout with an explicit disk size and P9
+// buildSampleLayoutSized is buildSampleLayout with an explicit disk size and P3
 // size, for tests that need a larger persist partition (e.g. a combined
 // shrink+grow in one Run, where go-diskfs rounds the shrink up to a whole GB).
-func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
+func buildSampleLayoutSized(t *testing.T, diskMB, p3MB int64) sampleLayout {
 	t.Helper()
 	if _, err := exec.LookPath("mksquashfs"); err != nil {
 		t.Skip("mksquashfs not available")
@@ -92,7 +94,7 @@ func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
 	imgaStart := espStart + uint64(espMB*sectorMB)
 	imgbStart := imgaStart + uint64(imgaMB*sectorMB)
 	configStart := imgbStart + uint64(imgbMB*sectorMB)
-	p9Start := configStart + uint64(configMB*sectorMB)
+	p3Start := configStart + uint64(configMB*sectorMB)
 
 	f, err := os.Create(imgPath)
 	if err != nil {
@@ -115,11 +117,11 @@ func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
 
 	table := &gpt.Table{
 		Partitions: []*gpt.Partition{
-			{Index: espIndex, Start: espStart, Size: espMB * MB, Type: gpt.EFISystemPartition, Name: "ESP"},
+			{Index: espIndex, Start: espStart, Size: espMB * MB, Type: gpt.EFISystemPartition, Name: "EFI System"},
 			{Index: imgaIndex, Start: imgaStart, Size: imgaMB * MB, Type: gpt.LinuxFilesystem, Name: "IMGA"},
 			{Index: imgbIndex, Start: imgbStart, Size: imgbMB * MB, Type: gpt.LinuxFilesystem, Name: "IMGB"},
 			{Index: configIndex, Start: configStart, Size: configMB * MB, Type: gpt.LinuxFilesystem, Name: "CONFIG"},
-			{Index: p9Index, Start: p9Start, Size: uint64(p9MB) * MB, Type: gpt.LinuxFilesystem, Name: "P9"},
+			{Index: p3Index, Start: p3Start, Size: uint64(p3MB) * MB, Type: gpt.LinuxFilesystem, Name: "P3"},
 		},
 	}
 	if err := d.Partition(table); err != nil {
@@ -127,18 +129,18 @@ func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
 	}
 
 	// ESP: real FAT32 with a marker file
-	espFS, err := d.CreateFilesystem(disk.FilesystemSpec{Partition: espIndex, FSType: filesystem.TypeFat32, VolumeLabel: "ESP"})
+	espFS, err := d.CreateFilesystem(disk.FilesystemSpec{Partition: espIndex, FSType: filesystem.TypeFat32, VolumeLabel: "EFI System"})
 	if err != nil {
 		t.Fatalf("create ESP fat32: %v", err)
 	}
 	writeMarker(t, espFS, "/esp-marker.txt", "esp content")
 
-	// P9: real ext4 with a marker file
-	p9FS, err := d.CreateFilesystem(disk.FilesystemSpec{Partition: p9Index, FSType: filesystem.TypeExt4, VolumeLabel: "P9"})
+	// P3: real ext4 with a marker file
+	p3FS, err := d.CreateFilesystem(disk.FilesystemSpec{Partition: p3Index, FSType: filesystem.TypeExt4, VolumeLabel: "P3"})
 	if err != nil {
-		t.Fatalf("create P9 ext4: %v", err)
+		t.Fatalf("create P3 ext4: %v", err)
 	}
-	writeMarker(t, p9FS, "/p9-marker.txt", "persist content")
+	writeMarker(t, p3FS, "/p3-marker.txt", "persist content")
 
 	// IMGA/IMGB: real squashfs images built with mksquashfs and written raw
 	writeSquashfsImage(t, d, imgaStart, "IMGA")
@@ -150,12 +152,12 @@ func buildSampleLayoutSized(t *testing.T, diskMB, p9MB int64) sampleLayout {
 	return sampleLayout{
 		path:        imgPath,
 		diskMB:      diskMB,
-		p9MB:        p9MB,
+		p3MB:        p3MB,
 		espStart:    espStart,
 		imgaStart:   imgaStart,
 		imgbStart:   imgbStart,
 		configStart: configStart,
-		p9Start:     p9Start,
+		p3Start:     p3Start,
 		// fingerprint the leading 1 MB of each IMG region (squashfs blob plus
 		// trailing zeros) so a raw relocation can be checked for fidelity
 		imgaSum: partitionRegionSum(t, imgPath, imgaStart, 1*MB),
@@ -248,7 +250,7 @@ func gptByName(t *testing.T, path string) map[string]*gpt.Partition {
 }
 
 // TestSampleLayoutSmoke is a non-interrupted end-to-end check of the scaled sample
-// layout: build it, shrink P9 (Case 1), then grow ESP/IMGA/IMGB into the freed
+// layout: build it, shrink P3 (Case 1), then grow ESP/IMGA/IMGB into the freed
 // space with the updatePartitions finalize (Case 2), asserting the layout and
 // that IMG content survives the raw relocation.
 func TestSampleLayoutSmoke(t *testing.T) {
@@ -264,20 +266,20 @@ func TestSampleLayoutSmoke(t *testing.T) {
 	report := describeLayout(t, fx.path)
 	t.Logf("fixture filesystems:\n%s", report)
 
-	// Case 1: shrink P9 by 600 MB (free space at the end of the disk)
-	p9Shrink := []PartitionChange{NewPartitionChange(IdentifierByLabel, "P9", (defaultP9MB-600)*MB)}
-	if err := Run(fx.path, nil, p9Shrink, false, false, false); err != nil {
-		t.Fatalf("Case 1 (shrink P9) failed: %v", err)
+	// Case 1: shrink P3 by 600 MB (free space at the end of the disk)
+	p3Shrink := []PartitionChange{NewPartitionChange(IdentifierByLabel, "P3", (defaultP3MB-600)*MB)}
+	if err := Run(fx.path, nil, p3Shrink, false, false, false); err != nil {
+		t.Fatalf("Case 1 (shrink P3) failed: %v", err)
 	}
 	after1 := gptByName(t, fx.path)
-	if got := int64(after1["P9"].GetSize()); got != (defaultP9MB-600)*MB {
-		t.Errorf("after Case 1: P9 size = %d, want %d", got, (defaultP9MB-600)*MB)
+	if got := int64(after1["P3"].GetSize()); got != (defaultP3MB-600)*MB {
+		t.Errorf("after Case 1: P3 size = %d, want %d", got, (defaultP3MB-600)*MB)
 	}
 
 	// Case 2: grow ESP/IMGA/IMGB into the freed space; preserveNumbers keeps
 	// their original indices/labels via updatePartitions
 	grow := []PartitionChange{
-		NewPartitionChange(IdentifierByLabel, "ESP", 96*MB),
+		NewPartitionChange(IdentifierByLabel, "EFI System", 96*MB),
 		NewPartitionChange(IdentifierByLabel, "IMGA", 200*MB),
 		NewPartitionChange(IdentifierByLabel, "IMGB", 200*MB),
 	}
@@ -287,20 +289,20 @@ func TestSampleLayoutSmoke(t *testing.T) {
 
 	after2 := gptByName(t, fx.path)
 	// ESP/IMGA/IMGB keep their labels and indices, now at the end of the disk
-	for _, name := range []string{"ESP", "IMGA", "IMGB", "CONFIG", "P9"} {
+	for _, name := range []string{"EFI System", "IMGA", "IMGB", "CONFIG", "P3"} {
 		if _, ok := after2[name]; !ok {
 			t.Errorf("after Case 2: partition %q missing", name)
 		}
 	}
-	if after2["ESP"].Index != espIndex || after2["IMGA"].Index != imgaIndex || after2["IMGB"].Index != imgbIndex {
-		t.Errorf("after Case 2: indices not preserved: ESP=%d IMGA=%d IMGB=%d", after2["ESP"].Index, after2["IMGA"].Index, after2["IMGB"].Index)
+	if after2["EFI System"].Index != espIndex || after2["IMGA"].Index != imgaIndex || after2["IMGB"].Index != imgbIndex {
+		t.Errorf("after Case 2: indices not preserved: ESP=%d IMGA=%d IMGB=%d", after2["EFI System"].Index, after2["IMGA"].Index, after2["IMGB"].Index)
 	}
-	// the grown ESP/IMGA/IMGB must now start after the (shrunken) P9
-	if after2["IMGA"].Start <= after2["P9"].Start {
-		t.Errorf("after Case 2: IMGA (start %d) should be relocated past P9 (start %d)", after2["IMGA"].Start, after2["P9"].Start)
+	// the grown ESP/IMGA/IMGB must now start after the (shrunken) P3
+	if after2["IMGA"].Start <= after2["P3"].Start {
+		t.Errorf("after Case 2: IMGA (start %d) should be relocated past P3 (start %d)", after2["IMGA"].Start, after2["P3"].Start)
 	}
-	if int64(after2["IMGA"].GetSize()) != 200*MB || int64(after2["IMGB"].GetSize()) != 200*MB || int64(after2["ESP"].GetSize()) != 96*MB {
-		t.Errorf("after Case 2: grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after2["ESP"].GetSize(), after2["IMGA"].GetSize(), after2["IMGB"].GetSize())
+	if int64(after2["IMGA"].GetSize()) != 200*MB || int64(after2["IMGB"].GetSize()) != 200*MB || int64(after2["EFI System"].GetSize()) != 96*MB {
+		t.Errorf("after Case 2: grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after2["EFI System"].GetSize(), after2["IMGA"].GetSize(), after2["IMGB"].GetSize())
 	}
 	// IMG content survived the raw relocation (compare the relocated region to
 	// the build-time fingerprint of the source region)
@@ -324,7 +326,7 @@ func describeLayout(t *testing.T, path string) string {
 		t.Fatalf("open backend: %v", err)
 	}
 	var s string
-	for _, idx := range []int{espIndex, imgaIndex, imgbIndex, p9Index} {
+	for _, idx := range []int{espIndex, imgaIndex, imgbIndex, p3Index} {
 		fs, err := d.GetFilesystem(idx)
 		if err != nil {
 			s += fmt.Sprintf("  partition %d: GetFilesystem error: %v\n", idx, err)
@@ -363,29 +365,29 @@ func readPartitionFile(t *testing.T, path string, partIndex int, name string) st
 	return string(data)
 }
 
-// shrinkP9 is the Case 1 operation: shrink the P9 ext4 partition in place by
+// shrinkP3 is the Case 1 operation: shrink the P3 ext4 partition in place by
 // 600 MB, freeing space at the end of the disk. It is expressed as a
 // PartitionChange to a smaller size (calculateResizes treats target < original
 // as a shrink in place).
-var shrinkP9 = []PartitionChange{NewPartitionChange(IdentifierByLabel, "P9", (defaultP9MB-600)*MB)}
+var shrinkP3 = []PartitionChange{NewPartitionChange(IdentifierByLabel, "P3", (defaultP3MB-600)*MB)}
 
 // growImages is the Case 2 operation: grow ESP/IMGA/IMGB into the freed space.
 var growImages = []PartitionChange{
-	NewPartitionChange(IdentifierByLabel, "ESP", 96*MB),
+	NewPartitionChange(IdentifierByLabel, "EFI System", 96*MB),
 	NewPartitionChange(IdentifierByLabel, "IMGA", 200*MB),
 	NewPartitionChange(IdentifierByLabel, "IMGB", 200*MB),
 }
 
 // dummyShrink is an unused shrink identifier required by runResizeStepsUpTo's
 // signature; both cases drive their shrink/grow entirely through the grow
-// list (P9-in-place for Case 1, free-space grows for Case 2), so planResizes
+// list (P3-in-place for Case 1, free-space grows for Case 2), so planResizes
 // never consults shrinkPartition.
-func dummyShrink() PartitionIdentifier { return NewPartitionIdentifier(IdentifierByLabel, "P9") }
+func dummyShrink() PartitionIdentifier { return NewPartitionIdentifier(IdentifierByLabel, "P3") }
 
 // TestRunResumeShrink is Case 1 through the interrupt/resume harness: on the
-// scaled sample layout, interrupt the in-place P9 shrink after each step, re-run to
-// completion, and confirm P9 is shrunk (with its content and the other
-// partitions intact). Exercises the non-contiguous P9 index (index 9) that the
+// scaled sample layout, interrupt the in-place P3 shrink after each step, re-run to
+// completion, and confirm P3 is shrunk (with its content and the other
+// partitions intact). Exercises the non-contiguous P3 index (index 9) that the
 // shrinkPartitions fix addresses.
 func TestRunResumeShrink(t *testing.T) {
 	if testing.Short() {
@@ -394,42 +396,42 @@ func TestRunResumeShrink(t *testing.T) {
 	for _, stopAfter := range []int{stepShrinkFilesystems, stepShrinkPartitions, stepUpdatePartitions} {
 		t.Run(fmt.Sprintf("stopAfter=%d", stopAfter), func(t *testing.T) {
 			fx := buildSampleLayout(t)
-			runResizeStepsUpTo(t, fx.path, dummyShrink(), shrinkP9, false, stopAfter, false, false)
-			if err := Run(fx.path, nil, shrinkP9, false, false, false); err != nil {
+			runResizeStepsUpTo(t, fx.path, dummyShrink(), shrinkP3, false, stopAfter, false, false)
+			if err := Run(fx.path, nil, shrinkP3, false, false, false); err != nil {
 				t.Fatalf("resume Run failed: %v", err)
 			}
 			after := gptByName(t, fx.path)
-			if got := int64(after["P9"].GetSize()); got != (defaultP9MB-600)*MB {
-				t.Errorf("P9 size = %d, want %d", got, (defaultP9MB-600)*MB)
+			if got := int64(after["P3"].GetSize()); got != (defaultP3MB-600)*MB {
+				t.Errorf("P3 size = %d, want %d", got, (defaultP3MB-600)*MB)
 			}
-			// P9 data preserved, other partitions untouched
-			if got := readPartitionFile(t, fx.path, p9Index, "/p9-marker.txt"); got != "persist content" {
-				t.Errorf("P9 marker = %q, want %q", got, "persist content")
+			// P3 data preserved, other partitions untouched
+			if got := readPartitionFile(t, fx.path, p3Index, "/p3-marker.txt"); got != "persist content" {
+				t.Errorf("P3 marker = %q, want %q", got, "persist content")
 			}
-			for _, name := range []string{"ESP", "IMGA", "IMGB", "CONFIG"} {
+			for _, name := range []string{"EFI System", "IMGA", "IMGB", "CONFIG"} {
 				if _, ok := after[name]; !ok {
 					t.Errorf("partition %q missing after shrink", name)
 				}
 			}
-			if int64(after["ESP"].GetSize()) != espMB*MB || after["IMGA"].Start != fx.imgaStart {
-				t.Errorf("non-P9 partitions changed: ESP size=%d IMGA start=%d", after["ESP"].GetSize(), after["IMGA"].Start)
+			if int64(after["EFI System"].GetSize()) != espMB*MB || after["IMGA"].Start != fx.imgaStart {
+				t.Errorf("non-P3 partitions changed: ESP size=%d IMGA start=%d", after["EFI System"].GetSize(), after["IMGA"].Start)
 			}
 		})
 	}
 }
 
 // TestRunResumeGrow is Case 2 through the interrupt/resume harness: starting
-// from the Case 1 result (P9 already shrunk), interrupt the grow of
+// from the Case 1 result (P3 already shrunk), interrupt the grow of
 // ESP/IMGA/IMGB after each step, re-run to completion, and confirm the grown
 // partitions are relocated to the end of the disk under their original
-// labels/indices with content intact, while P9/CONFIG are untouched.
+// labels/indices with content intact, while P3/CONFIG are untouched.
 func TestRunResumeGrow(t *testing.T) {
 	if testing.Short() {
 		t.Skip("slow end-to-end resize test")
 	}
 	// build the fixture and run Case 1 once to produce the post-shrink base disk
 	base := buildSampleLayout(t)
-	if err := Run(base.path, nil, shrinkP9, false, false, false); err != nil {
+	if err := Run(base.path, nil, shrinkP3, false, false, false); err != nil {
 		t.Fatalf("Case 1 (shrink) setup failed: %v", err)
 	}
 
@@ -445,16 +447,16 @@ func TestRunResumeGrow(t *testing.T) {
 			}
 
 			after := gptByName(t, diskCopy)
-			// grown partitions keep label+index, relocated past P9, at target size
-			if after["ESP"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
-				t.Errorf("indices not preserved: ESP=%d IMGA=%d IMGB=%d", after["ESP"].Index, after["IMGA"].Index, after["IMGB"].Index)
+			// grown partitions keep label+index, relocated past P3, at target size
+			if after["EFI System"].Index != espIndex || after["IMGA"].Index != imgaIndex || after["IMGB"].Index != imgbIndex {
+				t.Errorf("indices not preserved: ESP=%d IMGA=%d IMGB=%d", after["EFI System"].Index, after["IMGA"].Index, after["IMGB"].Index)
 			}
-			if after["IMGA"].Start <= after["P9"].Start || after["IMGB"].Start <= after["P9"].Start || after["ESP"].Start <= after["P9"].Start {
-				t.Errorf("grown partitions not relocated past P9: ESP=%d IMGA=%d IMGB=%d P9=%d",
-					after["ESP"].Start, after["IMGA"].Start, after["IMGB"].Start, after["P9"].Start)
+			if after["IMGA"].Start <= after["P3"].Start || after["IMGB"].Start <= after["P3"].Start || after["EFI System"].Start <= after["P3"].Start {
+				t.Errorf("grown partitions not relocated past P3: ESP=%d IMGA=%d IMGB=%d P3=%d",
+					after["EFI System"].Start, after["IMGA"].Start, after["IMGB"].Start, after["P3"].Start)
 			}
-			if int64(after["ESP"].GetSize()) != 96*MB || int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB {
-				t.Errorf("grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after["ESP"].GetSize(), after["IMGA"].GetSize(), after["IMGB"].GetSize())
+			if int64(after["EFI System"].GetSize()) != 96*MB || int64(after["IMGA"].GetSize()) != 200*MB || int64(after["IMGB"].GetSize()) != 200*MB {
+				t.Errorf("grown sizes wrong: ESP=%d IMGA=%d IMGB=%d", after["EFI System"].GetSize(), after["IMGA"].GetSize(), after["IMGB"].GetSize())
 			}
 			// content preserved: IMG raw images and the ESP marker
 			if got := partitionRegionSum(t, diskCopy, after["IMGA"].Start, 1*MB); got != base.imgaSum {
@@ -466,12 +468,12 @@ func TestRunResumeGrow(t *testing.T) {
 			if got := readPartitionFile(t, diskCopy, espIndex, "/esp-marker.txt"); got != "esp content" {
 				t.Errorf("ESP marker = %q, want %q", got, "esp content")
 			}
-			// P9 untouched (still shrunk, content intact)
-			if got := int64(after["P9"].GetSize()); got != (defaultP9MB-600)*MB {
-				t.Errorf("P9 size changed: %d", got)
+			// P3 untouched (still shrunk, content intact)
+			if got := int64(after["P3"].GetSize()); got != (defaultP3MB-600)*MB {
+				t.Errorf("P3 size changed: %d", got)
 			}
-			if got := readPartitionFile(t, diskCopy, p9Index, "/p9-marker.txt"); got != "persist content" {
-				t.Errorf("P9 marker = %q", got)
+			if got := readPartitionFile(t, diskCopy, p3Index, "/p3-marker.txt"); got != "persist content" {
+				t.Errorf("P3 marker = %q", got)
 			}
 		})
 	}
@@ -542,11 +544,11 @@ func TestLayoutStagesDump(t *testing.T) {
 	fx := buildSampleLayout(t)
 	t.Logf("Stage 1 - initial layout (disk %d MB):\n%s", defaultDiskMB, gptDump(t, fx.path))
 
-	// Stage 2: Case 1 shrinks P9 in place, freeing space at the end
-	if err := Run(fx.path, nil, shrinkP9, false, false, false); err != nil {
-		t.Fatalf("Case 1 (shrink P9): %v", err)
+	// Stage 2: Case 1 shrinks P3 in place, freeing space at the end
+	if err := Run(fx.path, nil, shrinkP3, false, false, false); err != nil {
+		t.Fatalf("Case 1 (shrink P3): %v", err)
 	}
-	t.Logf("Stage 2 - after P9 ext4 shrink (freed 600 MB at end):\n%s", gptDump(t, fx.path))
+	t.Logf("Stage 2 - after P3 ext4 shrink (freed 600 MB at end):\n%s", gptDump(t, fx.path))
 
 	// Stage 3: Case 2 up to and including copyFilesystems -- the *_resized2
 	// partitions have been created in the freed space and filled, originals
