@@ -11,6 +11,12 @@ import (
 	"github.com/diskfs/go-diskfs/sync"
 )
 
+// ErrRebootToApply signals that a new partition table was committed to disk but
+// the kernel could not re-read it live because the disk is busy (we are
+// repartitioning the disk we booted from). The caller should reboot; the next
+// boot's partition scan picks up the committed table. Detect with errors.Is.
+var ErrRebootToApply = errors.New("partition table committed to disk; reboot required to apply")
+
 // isUnknownFilesystem reports whether err is a *disk.UnknownFilesystemError.
 // Use errors.As so the per-instance partition field doesn't matter
 // (which it would with errors.Is against a zero-valued instance).
@@ -139,6 +145,9 @@ func updatePartitions(d *disk.Disk, resizes []partitionResizeTarget, preserveNum
 		table.Partitions = kept
 	}
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write updated partition table: %v", err)
 	}
 	return nil
@@ -198,6 +207,9 @@ func createPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	// write the updated partition table; we rely on the GPT implementation to sort out the ordering
 	table.Partitions = partitions
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write updated partition table: %v", err)
 	}
 	return nil
@@ -304,6 +316,9 @@ func removePartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	}
 	// write the updated partition table
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write updated partition table: %v", err)
 	}
 	return nil
@@ -369,6 +384,9 @@ func removeAndRenumberPartitions(d *disk.Disk, resizes []partitionResizeTarget) 
 	}
 	table.Partitions = partitions
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write renumbered partition table: %v", err)
 	}
 	return nil
@@ -417,6 +435,9 @@ func swapPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 	}
 	// write the updated partition table
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write updated partition table: %v", err)
 	}
 	return nil
@@ -535,6 +556,9 @@ func shrinkPartitions(d *disk.Disk, resizes []partitionResizeTarget) error {
 		return nil
 	}
 	if err := d.Partition(table); err != nil {
+		if errors.Is(err, disk.ErrReReadDeferred) {
+			return ErrRebootToApply
+		}
 		return fmt.Errorf("failed to write partition table after shrinking: %v", err)
 	}
 	return nil

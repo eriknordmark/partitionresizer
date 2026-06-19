@@ -51,7 +51,22 @@ var execE2fsck = func(partDevice string, fixErrors bool) error {
 	if fixErrors {
 		fixFlag = "-y"
 	}
-	return runTool("e2fsck", "-f", fixFlag, partDevice)
+	err := runTool("e2fsck", "-f", fixFlag, partDevice)
+	if err == nil || !fixErrors {
+		return err
+	}
+	// e2fsck's exit status is a bitmask: bit 0 (1) = filesystem errors were
+	// corrected, bit 1 (2) = corrected and a reboot is advised, bit 2 (4) =
+	// errors left UNcorrected, higher bits = operational/usage errors. When we
+	// asked it to repair (-y) -- e.g. recovering a dirty journal after a power
+	// loss, which is exactly the case this resizer must survive -- "corrected"
+	// is success. Only uncorrected (>=4) or operational errors are real failures.
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode()&^0x3 == 0 {
+		log.Printf("e2fsck repaired %s (exit %d); filesystem now clean, continuing", partDevice, ee.ExitCode())
+		return nil
+	}
+	return err
 }
 
 // execFsckFat runs fsck.fat on the given device or image file. By default it is

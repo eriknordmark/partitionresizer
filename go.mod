@@ -22,3 +22,5 @@ require (
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 )
+
+replace github.com/diskfs/go-diskfs => github.com/eriknordmark/go-diskfs v0.0.0-20260618133142-470c1e96eea8

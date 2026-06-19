@@ -763,6 +763,132 @@ func TestSwapPartitions(t *testing.T) {
 	}
 }
 
+// TestUpdatePartitionsPreservesAttributes verifies that the finalize step,
+// updatePartitions (which supersedes swapPartitions), gives a relocated target
+// the original partition's identity -- including the 64-bit GPT Attributes field
+// -- and removes the superseded original. Consumers may store boot-selection
+// state in that field (for example, a GPT-priority boot loader's
+// priority/tries/successful bits, as EVE's zboot does), so it must survive a
+// resize.
+func TestUpdatePartitionsPreservesAttributes(t *testing.T) {
+	for _, preserveNumbers := range []bool{false, true} {
+		variant := "renumber"
+		if preserveNumbers {
+			variant = "preserveNumbers"
+		}
+		t.Run(variant, func(t *testing.T) {
+			workDir := t.TempDir()
+			f, err := os.CreateTemp(workDir, "disk.img")
+			if err != nil {
+				t.Fatalf("failed to create temp disk image: %v", err)
+			}
+			if err := os.Truncate(f.Name(), 1*GB); err != nil {
+				t.Fatalf("failed to truncate disk image: %v", err)
+			}
+			defer func() { _ = f.Close() }()
+
+			backend := file.New(f, false)
+			d, err := diskfs.OpenBackend(backend, diskfs.WithOpenMode(diskfs.ReadWrite))
+			if err != nil {
+				t.Fatalf("failed to open disk: %v", err)
+			}
+
+			const (
+				origGUID  = "11111111-2222-3333-4444-555555555555"
+				origName  = "part1"
+				altName   = "part1_resized2"
+				origAttrs = uint64(0x102) // arbitrary non-zero attribute bits (e.g. GPT-priority boot flags)
+			)
+			// Original at sector 2048; the relocated target (the _resized2
+			// partition createPartitions makes) lives further along the disk.
+			var origStart uint64 = 2048
+			var targetStart uint64 = 200000
+			table := &gpt.Table{
+				Partitions: []*gpt.Partition{
+					{
+						Index:      1,
+						Start:      origStart,
+						Size:       36 * MB,
+						Type:       gpt.LinuxFilesystem,
+						GUID:       origGUID,
+						Name:       origName,
+						Attributes: origAttrs,
+					},
+					{
+						Index: 3,
+						Start: targetStart,
+						Size:  64 * MB,
+						Type:  gpt.LinuxFilesystem,
+						Name:  altName,
+						// Attributes deliberately left 0 to prove updatePartitions
+						// copies them from the original, not that they merely
+						// happened to be set when the partition was created.
+					},
+				},
+			}
+			if err := d.Partition(table); err != nil {
+				t.Fatalf("failed to write partition table: %v", err)
+			}
+
+			tableRaw, err := d.GetPartitionTable()
+			if err != nil {
+				t.Fatalf("failed to re-read partition table: %v", err)
+			}
+			sectorSize := int64(tableRaw.(*gpt.Table).LogicalSectorSize)
+			if sectorSize == 0 {
+				sectorSize = 512
+			}
+
+			resizes := []partitionResizeTarget{
+				{
+					original: partitionData{number: 1, label: origName, start: int64(origStart) * sectorSize},
+					target:   partitionData{number: 3, start: int64(targetStart) * sectorSize},
+				},
+			}
+			if err := updatePartitions(d, resizes, preserveNumbers); err != nil {
+				t.Fatalf("updatePartitions failed: %v", err)
+			}
+
+			tableRaw, err = d.GetPartitionTable()
+			if err != nil {
+				t.Fatalf("failed to re-read partition table after finalize: %v", err)
+			}
+			var final, leftover *gpt.Partition
+			for _, p := range tableRaw.(*gpt.Table).Partitions {
+				if p.Type == gpt.Unused {
+					continue
+				}
+				switch p.Start {
+				case targetStart:
+					final = p
+				case origStart:
+					leftover = p
+				}
+			}
+			if leftover != nil {
+				t.Errorf("original partition at start %d still present after finalize", origStart)
+			}
+			if final == nil {
+				t.Fatalf("relocated partition at start %d missing after finalize", targetStart)
+			}
+			if final.Name != origName {
+				t.Errorf("relocated Name = %q, want %q", final.Name, origName)
+			}
+			if final.Attributes != origAttrs {
+				t.Errorf("relocated Attributes = 0x%x, want 0x%x (attribute bits must survive resize)",
+					final.Attributes, origAttrs)
+			}
+			wantIndex := 3
+			if preserveNumbers {
+				wantIndex = 1
+			}
+			if int(final.Index) != wantIndex {
+				t.Errorf("relocated Index = %d, want %d", final.Index, wantIndex)
+			}
+		})
+	}
+}
+
 // TestShrinkFilesystems verifies that shrinkFilesystems skips
 // partitions already at or below target size, invokes resize2fs only
 // when a shrink is needed, and propagates resize errors.

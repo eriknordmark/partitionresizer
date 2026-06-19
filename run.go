@@ -63,11 +63,21 @@ func Run(disk string, shrinkPartition *PartitionIdentifier, growPartitions []Par
 
 	// now we have the desired disk, either passed explicitly or found by discovery
 
-	backend, err := file.OpenFromPath(disk, false)
+	// Open the whole disk read-write but NOT O_EXCL. partitionresizer shells out
+	// to e2fsck/resize2fs/fsck.fat on the child partitions, which open those
+	// partitions O_EXCL. On a real block device, holding the parent disk O_EXCL
+	// makes those child opens fail with "device is in use" (the kernel's
+	// partition claim hierarchy). OpenFromPathWithExclusive(..., false) opens
+	// non-exclusively while still recording the path (which the source-filesystem
+	// checks need). The caller guarantees the partitions are unmounted.
+	backendFile, err := file.OpenFromPathWithExclusive(disk, false, false)
 	if err != nil {
 		return err
 	}
-	d, err := diskfs.OpenBackend(backend)
+	// maybeWrapBackend is a no-op in normal builds; in -tags chaos builds it can
+	// inject delays around GPT-sector writes (see RESIZER_GPT_WRITE_DELAY) so
+	// crash-injection tests can land between the backup/primary GPT writes.
+	d, err := diskfs.OpenBackend(maybeWrapBackend(backendFile))
 	if err != nil {
 		return err
 	}
