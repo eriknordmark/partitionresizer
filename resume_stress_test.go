@@ -277,7 +277,7 @@ func TestChaosKill(t *testing.T) {
 	shrinkArgs := []string{"--grow-partition", "label:P3:300M"} // Case 1: shrink P3 in place
 	growArgs := []string{                                       // Case 2: grow into the freed space
 		"--preserve-numbers",
-		"--grow-partition", "label:ESP:96M",
+		"--grow-partition", "label:EFI System:96M",
 		"--grow-partition", "label:IMGA:200M",
 		"--grow-partition", "label:IMGB:200M",
 	}
