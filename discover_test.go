@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -175,4 +176,58 @@ func TestFindDisks(t *testing.T) {
 			t.Fatalf("unexpected disks map from disk image: %v", disks)
 		}
 	})
+}
+
+// TestFindDisksPopulatesPartUUID verifies the sysfs (block-device) discovery
+// path fills in the partition GUID from the uevent PARTUUID key, so a caller can
+// select a partition by IdentifierByUUID on a real device. Without it, uuid is
+// empty and filterDisksByPartitions can never match a UUID identifier — a gap
+// invisible to the image-file path, which already sets uuid from go-diskfs.
+//
+// The GUID is normalized to upper case to match go-diskfs's UUID(), which
+// convert.go compares against when resolving the same identifier on the GPT; a
+// lower-case value from the uevent would silently fail that later comparison.
+func TestFindDisksPopulatesPartUUID(t *testing.T) {
+	const (
+		partUUIDLower = "a94e71c5-a294-4512-8974-b2d52289ea18"
+		wantLabel     = "EFI System"
+	)
+	tmp := t.TempDir()
+	diskDir := filepath.Join(tmp, "class", "block", "sdy")
+	if err := os.MkdirAll(filepath.Join(diskDir, "queue"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diskDir, "queue", "logical_block_size"), []byte("512\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	part := filepath.Join(diskDir, "sdy1")
+	if err := os.Mkdir(part, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, val := range map[string]string{"partition": "1\n", "start": "2\n", "size": "4\n"} {
+		if err := os.WriteFile(filepath.Join(part, name), []byte(val), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	uevent := "PARTNAME=" + wantLabel + "\nPARTUUID=" + partUUIDLower + "\n"
+	if err := os.WriteFile(filepath.Join(part, "uevent"), []byte(uevent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	disks, err := findDisks("", tmp)
+	if err != nil {
+		t.Fatalf("findDisks error: %v", err)
+	}
+	data, ok := disks["sdy"]
+	if !ok || len(data) != 1 {
+		t.Fatalf("unexpected disks map: %v", disks)
+	}
+	pd := data[0]
+	if pd.label != wantLabel {
+		t.Errorf("pd.label = %q, want %q", pd.label, wantLabel)
+	}
+	want := strings.ToUpper(partUUIDLower)
+	if pd.uuid != want {
+		t.Errorf("pd.uuid = %q, want %q", pd.uuid, want)
+	}
 }
